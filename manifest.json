@@ -1,0 +1,31 @@
+{
+  "name": "mofox_plugin_immersive_control",
+  "display_name": "沉浸式控制",
+  "version": "1.0.0",
+  "description": "AstrBot 沉浸式控制插件的 Neo-MoFox 移植版：限时互动、冷却、权限与持久化",
+  "author": "ikun-1145141（移植）；木有知、Zhalslar（原作）",
+  "license": "AGPL-3.0",
+  "repository": "https://github.com/ikun-1145141/mofox_plugin_immersive_control",
+  "entry_point": "plugin.py",
+  "min_core_version": "1.2.0",
+  "api_version": {
+    "config_api": "1.0.0",
+    "log_api": "1.0.0",
+    "permission_api": "1.0.0",
+    "send_api": "1.0.0",
+    "adapter_api": "1.0.0"
+  },
+  "dependencies": {
+    "plugins": ["default_chatter"],
+    "components": ["default_chatter:chatter:default_chatter"]
+  },
+  "include": [
+    {"component_type": "event_handler", "component_name": "immersive_message", "dependencies": []},
+    {"component_type": "event_handler", "component_name": "immersive_prompt", "dependencies": []},
+    {"component_type": "command", "component_name": "imm_status", "dependencies": []},
+    {"component_type": "command", "component_name": "imm_clear", "dependencies": []},
+    {"component_type": "command", "component_name": "imm_reload", "dependencies": []}
+  ],
+  "python_dependencies": [],
+  "dependencies_required": true
+}
