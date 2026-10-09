@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from src.app.plugin_system.api import adapter_api, permission_api
 from src.app.plugin_system.base import BaseEventHandler
@@ -11,6 +12,7 @@ from src.kernel.event import EventDecision
 
 from .config import DEFAULT_ENTER_TEMPLATE, DEFAULT_EXIT_TEMPLATE
 from .logic import (
+    body_mention_ids,
     describe_electric,
     describe_level,
     effective_sensitivity,
@@ -23,9 +25,9 @@ from .logic import (
     render_prompt,
 )
 from .prompts import DEFAULT_ELECTRIC_TEMPLATE, DEFAULT_OVERLOAD_TEMPLATE
+from .request_scope import resolve_request_scope
 
 PROMPT_MARKER = "[mofox_immersive_control:transient]\n"
-_EXIT_RETRY_METADATA_KEY = "_mofox_immersive_exit_retry"
 
 
 class ImmersiveMessageHandler(BaseEventHandler):
@@ -73,8 +75,14 @@ class ImmersiveMessageHandler(BaseEventHandler):
             bot_info = await adapter_api.get_bot_info_by_platform(message.platform) or {}
             bot_id = str(bot_info.get("bot_id") or "")
             at_users = message.extra.get("at_users") or []
+            # Converter 会把引用消息里的 @ 合并到 at_users；真实信封存在时
+            # 只认可正文段里的提及，避免引用预览触发未显式发送的群聊指令。
+            body_mentions = body_mention_ids(params.get("envelope"))
             if not bot_id or not any(
-                isinstance(user, dict) and str(user.get("user_id")) == bot_id for user in at_users
+                isinstance(user, dict)
+                and str(user.get("user_id")) == bot_id
+                and (body_mentions is None or bot_id in body_mentions)
+                for user in at_users
             ):
                 return EventDecision.PASS, params
         if settings.admin_only_mode:
@@ -220,12 +228,22 @@ class ImmersivePromptHandler(BaseEventHandler):
         EventType.ON_LLM_REQUEST_FAILED,
     ]
 
+    def __init__(self, plugin: Any) -> None:
+        super().__init__(plugin)
+        # 每次逻辑 send 创建独立的策略会话，内部重试共享同一会话。
+        # 弱键随请求结束回收，失败/取消后再次 send 不会复用旧退出提示。
+        self._exit_retry_prompts: WeakKeyDictionary[object, tuple[str, str]] = WeakKeyDictionary()
+
     async def execute(self, event_name: str, params: dict[str, Any]) -> tuple[EventDecision, dict[str, Any]]:
         """使用既有 payloads 键，保持 EventBus 顶层参数集合不变。"""
         metadata = params.get("meta_data")
         if event_name in (EventType.AFTER_LLM_REQUEST, EventType.ON_LLM_REQUEST_FAILED):
-            if isinstance(metadata, dict):
-                metadata.pop(_EXIT_RETRY_METADATA_KEY, None)
+            # dev 的失败事件按每次 provider 尝试触发，不能把它当作重试终态。
+            # 成功时主动清理；重试耗尽和取消依靠逻辑请求作用域的弱引用回收。
+            if event_name == EventType.AFTER_LLM_REQUEST and isinstance(metadata, dict):
+                scope = resolve_request_scope(metadata, params.get("request_name"))
+                if scope is not None:
+                    self._exit_retry_prompts.pop(scope, None)
             return EventDecision.SUCCESS, params
         payloads = params.get("payloads")
         if not isinstance(payloads, list):
@@ -238,13 +256,10 @@ class ImmersivePromptHandler(BaseEventHandler):
         stream_id = metadata.get("stream_id") if isinstance(metadata, dict) else None
         if not isinstance(stream_id, str) or not stream_id:
             return EventDecision.SUCCESS, params
-        cached_exit = metadata.get(_EXIT_RETRY_METADATA_KEY)
-        if (
-            isinstance(cached_exit, dict)
-            and cached_exit.get("stream_id") == stream_id
-            and isinstance(cached_exit.get("prompt"), str)
-        ):
-            prompt = cached_exit["prompt"]
+        scope = resolve_request_scope(metadata, params.get("request_name"))
+        cached_exit = self._exit_retry_prompts.get(scope) if scope is not None else None
+        if cached_exit is not None and cached_exit[0] == stream_id:
+            prompt = cached_exit[1]
         else:
             record = await self.plugin.store.get(stream_id)
             if record is None:
@@ -288,10 +303,8 @@ class ImmersivePromptHandler(BaseEventHandler):
                         voltage=record.voltage,
                         overload_voltage=settings.overload_voltage,
                     )
-            if not record.active:
-                # EventBus 浅拷贝顶层字典，meta_data 仍是同一逻辑请求的对象。
-                # 保留已消费的退出提示供 provider 重试；成功或重试耗尽即移除。
-                metadata[_EXIT_RETRY_METADATA_KEY] = {"stream_id": stream_id, "prompt": prompt}
+            if not record.active and scope is not None:
+                self._exit_retry_prompts[scope] = (stream_id, prompt)
         index = next((i + 1 for i, payload in enumerate(cleaned) if payload.role == ROLE.SYSTEM), 0)
         cleaned.insert(index, LLMPayload(ROLE.SYSTEM, Text(PROMPT_MARKER + prompt)))
         return EventDecision.SUCCESS, params

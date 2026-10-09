@@ -1,6 +1,6 @@
 [project]
 name = "mofox-plugin-immersive-control"
-version = "1.2.0"
+version = "1.2.1"
 description = "Neo-MoFox 沉浸式控制插件"
 requires-python = ">=3.11"
 

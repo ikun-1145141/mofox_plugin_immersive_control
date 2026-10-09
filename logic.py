@@ -4,19 +4,82 @@ import re
 from collections.abc import Sequence
 
 _LEADING_MENTION = re.compile(r"^(?:@<[^>]+>|\[CQ:at,[^\]]+\])\s*")
+# 匹配完整的框架回复前缀；预览可以含换行或 ]，直到首个 ]，说：。
+# 不剥离普通引用、未知方括号或媒体标记，避免把正文误认成指令。
+_LEADING_REPLY = re.compile(
+    r"^(?:\[回复<[^>]*>：.*?\]，说：|\[回复:[^\]\r\n]*\]|\[回复\]|「回复：[^」]*」)\s*",
+    re.DOTALL,
+)
 LEVEL_NAMES = ("轻柔", "低档", "中档", "高档", "强档")
 _CHINESE_LEVELS = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
 
 
 def normalize_message(text: str) -> tuple[str, bool]:
-    """剥离框架格式的前置 @，记录是否显式使用 / 前缀。"""
+    """剥离框架前置 @ 和回复预览，记录是否显式使用 / 前缀。"""
     text = text.strip()
-    while match := _LEADING_MENTION.match(text):
+    while match := _LEADING_MENTION.match(text) or _LEADING_REPLY.match(text):
         text = text[match.end() :].lstrip()
     explicit = text.startswith("/")
     if explicit:
         text = text[1:].lstrip()
     return " ".join(text.split()), explicit
+
+
+def body_mention_ids(envelope: object) -> set[str] | None:
+    """提取正文 @，排除转换器合并到 at_users 中的引用提及。
+
+    缺少可识别消息段时返回 None，供旧事件来源沿用已有元数据。
+    真实空段列表返回空集；与转换器一致，最多解析 5 层。
+    """
+    if not isinstance(envelope, dict):
+        return None
+    raw = envelope.get("message_segment")
+    if raw is None:
+        raw = envelope.get("message_chain")
+    if isinstance(raw, dict) and isinstance(raw.get("type"), str):
+        segments = [raw]
+    elif isinstance(raw, list):
+        if raw and not any(
+            isinstance(segment, dict) and isinstance(segment.get("type"), str) for segment in raw
+        ):
+            return None
+        segments = raw
+    else:
+        return None
+
+    def walk(parts: list, depth: int) -> tuple[set[str], bool, str | None]:
+        if depth >= 5:
+            return set(), False, None
+        mentions: set[str] = set()
+        has_reply = False
+        first_text = None
+        for segment in parts:
+            if not isinstance(segment, dict):
+                continue
+            kind, data = segment.get("type"), segment.get("data", "")
+            rendered = None
+            if kind == "reply":
+                has_reply = True
+            elif kind == "at":
+                if isinstance(data, str):
+                    mentions.add(data.split(":", 1)[1] if ":" in data else data)
+                rendered = "@"
+            elif kind == "text":
+                rendered = str(data)
+            elif kind == "seglist" and isinstance(data, list):
+                inner_mentions, inner_reply, rendered = walk(data, depth + 1)
+                has_reply = has_reply or inner_reply
+                preview = rendered.strip() if rendered is not None else ""
+                if not inner_reply and not preview.startswith(("[回复<", "「回复：")):
+                    mentions.update(inner_mentions)
+            else:
+                rendered = f"[{kind}]"
+            if first_text is None and rendered is not None:
+                first_text = rendered
+        return mentions, has_reply, first_text
+
+    mentions, _, _ = walk(segments, 0)
+    return mentions
 
 
 def matches_keyword(text: str, keywords: Sequence[str]) -> bool:

@@ -46,6 +46,246 @@ class MessageNormalizationTests(unittest.TestCase):
             ("请问 @<机器人:100> 控制怎么用", False),
         )
 
+    def test_framework_reply_previews_allow_real_control_gear_and_electric_commands(self):
+        prefixes = (
+            "[回复<机器人(123)>：旧消息]，说：",
+            "[回复:message-id]",
+            "[回复]",
+            "「回复：旧消息」",
+        )
+        for prefix in prefixes:
+            with self.subTest(prefix=prefix):
+                text, explicit = LOGIC.normalize_message(prefix + " @<机器人:123> /控制")
+                self.assertEqual((text, explicit), ("控制", True))
+                self.assertEqual(LOGIC.match_control(text, ["控制", "td"], ["td stop"]), "enter")
+                text, explicit = LOGIC.normalize_message(prefix + " /档位 4")
+                self.assertEqual((text, explicit), ("档位 4", True))
+                self.assertEqual(LOGIC.parse_gear_command(text), ("set", 4))
+                text, explicit = LOGIC.normalize_message(prefix + " /电流 20")
+                self.assertEqual((text, explicit), ("电流 20", True))
+                self.assertEqual(LOGIC.parse_electric_command(text), ("enable", 20))
+
+    def test_multiline_reply_previews_and_mentions_are_removed_in_either_order(self):
+        raw = (
+            " @<小狐狸:42>\n[回复<机器人(123)>：第一行\n第二行]，说："
+            "\t[CQ:at,qq=123]\u3000[回复:id] 「回复：第三行\n第四行」 @<机器人:123> /td\tstop\u3000now "
+        )
+        normalized, explicit = LOGIC.normalize_message(raw)
+        self.assertEqual((normalized, explicit), ("td stop now", True))
+        self.assertEqual(LOGIC.match_control(normalized, ["td"], ["td stop"]), "exit")
+
+    def test_quoted_command_inside_reply_preview_does_not_trigger_control(self):
+        for preview in (
+            "[回复<机器人(123)>：/控制]，说：",
+            "「回复：/控制」",
+            "[回复:/控制]",
+        ):
+            for body in ("", "普通消息", "请问 /控制 是什么"):
+                with self.subTest(preview=preview, body=body):
+                    text, explicit = LOGIC.normalize_message(preview + body)
+                    self.assertEqual(text, body)
+                    self.assertFalse(explicit)
+                    self.assertIsNone(LOGIC.match_control(text, ["控制", "td"], ["td stop"]))
+                    self.assertIsNone(LOGIC.parse_gear_command(text))
+                    self.assertIsNone(LOGIC.parse_electric_command(text))
+
+    def test_reply_preview_with_brackets_uses_complete_terminator_without_eating_body(self):
+        self.assertEqual(
+            LOGIC.normalize_message("[回复<机器人(123)>：请看 [资料]，还有 /控制]，说：/档位 4"),
+            ("档位 4", True),
+        )
+        self.assertEqual(
+            LOGIC.normalize_message("[回复<机器人(123)>：旧消息]，说：普通消息 ]，说：/控制"),
+            ("普通消息 ]，说：/控制", False),
+        )
+
+    def test_ordinary_quotes_unknown_brackets_and_media_are_not_removed(self):
+        for raw in (
+            "「他说：/控制」 /控制",
+            "[引用: /控制] /控制",
+            "[标签] @<机器人:123> /控制",
+            "[图片] /控制",
+            "正文 [回复<机器人(123)>：/控制]，说：/电流 20",
+        ):
+            with self.subTest(raw=raw):
+                text, explicit = LOGIC.normalize_message(raw)
+                self.assertEqual(text, raw)
+                self.assertFalse(explicit)
+                self.assertIsNone(LOGIC.match_control(text, ["控制"], ["td stop"]))
+                self.assertIsNone(LOGIC.parse_electric_command(text))
+        self.assertEqual(
+            LOGIC.normalize_message("/控制 正文保留「回复：旧消息」和[回复:id]"),
+            ("控制 正文保留「回复：旧消息」和[回复:id]", True),
+        )
+
+    def test_incomplete_reply_preview_does_not_expose_embedded_commands(self):
+        for raw in (
+            "[回复<机器人(123)>：旧消息] /控制",
+            "[回复<机器人(123)>：/控制",
+            "「回复：/控制",
+            "[回复:id /控制",
+        ):
+            with self.subTest(raw=raw):
+                text, explicit = LOGIC.normalize_message(raw)
+                self.assertEqual(text, raw)
+                self.assertFalse(explicit)
+                self.assertIsNone(LOGIC.match_control(text, ["控制"], ["td stop"]))
+
+
+class BodyMentionTests(unittest.TestCase):
+    def test_real_single_segment_and_chain_parse_user_ids_exactly_like_converter(self):
+        self.assertEqual(
+            LOGIC.body_mention_ids({"message_segment": {"type": "at", "data": "机器人:123"}}), {"123"}
+        )
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {
+                    "message_chain": [
+                        {"type": "at", "data": "123"},
+                        {"type": "at", "data": "昵称:123:sub-id"},
+                        {"type": "at", "data": " 456 "},
+                        {"type": "at", "data": {"user_id": "789"}},
+                        {"type": "text", "data": "@<仅为文字:999> 控制"},
+                    ]
+                }
+            ),
+            {"123", "123:sub-id", " 456 "},
+        )
+
+    def test_reply_segments_do_not_count_quoted_ats_but_direct_body_at_counts(self):
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {
+                    "message_segment": [
+                        {"type": "reply", "data": [{"type": "at", "data": "机器人:123"}]},
+                        {"type": "at", "data": "成员:456"},
+                        {"type": "text", "data": "控制"},
+                    ]
+                }
+            ),
+            {"456"},
+        )
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {"message_segment": [{"type": "reply", "data": "old-message"}, {"type": "at", "data": "123"}]}
+            ),
+            {"123"},
+        )
+
+    def test_reply_seglist_wrapper_excludes_all_quoted_at_ids(self):
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {
+                    "message_segment": [
+                        {
+                            "type": "seglist",
+                            "data": [
+                                {"type": "reply", "data": "old-message"},
+                                {"type": "text", "data": "[回复<机器人(123)>：旧消息]，说："},
+                                {"type": "at", "data": "机器人:123"},
+                            ],
+                        },
+                        {"type": "text", "data": "控制"},
+                    ]
+                }
+            ),
+            set(),
+        )
+
+    def test_preview_only_seglist_formats_are_quotes_without_reply_segment(self):
+        for preview in ("[回复<机器人(123)>：旧消息]，说：", " 「回复：旧消息」"):
+            with self.subTest(preview=preview):
+                self.assertEqual(
+                    LOGIC.body_mention_ids(
+                        {
+                            "message_segment": [
+                                {
+                                    "type": "seglist",
+                                    "data": [
+                                        {"type": "text", "data": preview},
+                                        {"type": "at", "data": "123"},
+                                    ],
+                                },
+                                {"type": "at", "data": "456"},
+                            ]
+                        }
+                    ),
+                    {"456"},
+                )
+
+    def test_ordinary_nested_seglists_keep_body_ids_and_nested_reply_wrapper_is_skipped(self):
+        body = {
+            "type": "seglist",
+            "data": [
+                {"type": "text", "data": "普通正文"},
+                {"type": "seglist", "data": [{"type": "at", "data": "机器人:123"}]},
+            ],
+        }
+        self.assertEqual(LOGIC.body_mention_ids({"message_segment": body}), {"123"})
+        quoted = {
+            "type": "seglist",
+            "data": [
+                {"type": "text", "data": "引用包装"},
+                {"type": "seglist", "data": [{"type": "reply", "data": "old-message"}]},
+                {"type": "at", "data": "123"},
+            ],
+        }
+        self.assertEqual(LOGIC.body_mention_ids({"message_segment": quoted}), set())
+
+    def test_missing_or_unrecognizable_segments_fall_back_but_real_empty_body_does_not(self):
+        for envelope in (
+            None,
+            "invalid",
+            {},
+            {"message_info": {}},
+            {"message_segment": {}},
+            {"message_segment": [None]},
+        ):
+            with self.subTest(envelope=envelope):
+                self.assertIsNone(LOGIC.body_mention_ids(envelope))
+        for envelope in (
+            {"message_segment": []},
+            {"message_chain": []},
+            {"message_segment": {"type": "text", "data": "控制"}},
+            {"message_segment": [], "message_chain": [{"type": "at", "data": "123"}]},
+        ):
+            with self.subTest(envelope=envelope):
+                self.assertEqual(LOGIC.body_mention_ids(envelope), set())
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {"message_segment": None, "message_chain": [{"type": "at", "data": "123"}]}
+            ),
+            {"123"},
+        )
+
+    def test_first_rendered_text_rule_matches_converter_for_regular_seglist(self):
+        self.assertEqual(
+            LOGIC.body_mention_ids(
+                {
+                    "message_segment": {
+                        "type": "seglist",
+                        "data": [
+                            {"type": "text", "data": "普通正文先出现"},
+                            {"type": "text", "data": "[回复<机器人(123)>：正文中提及的格式]，说："},
+                            {"type": "at", "data": "123"},
+                        ],
+                    }
+                }
+            ),
+            {"123"},
+        )
+
+    def test_depth_cap_and_cyclic_seglists_terminate_without_recursion_error(self):
+        segment = {"type": "at", "data": "123"}
+        for _ in range(4):
+            segment = {"type": "seglist", "data": [segment]}
+        self.assertEqual(LOGIC.body_mention_ids({"message_segment": segment}), {"123"})
+        segment = {"type": "seglist", "data": [segment]}
+        self.assertEqual(LOGIC.body_mention_ids({"message_segment": segment}), set())
+        cyclic = []
+        cyclic.append({"type": "seglist", "data": cyclic})
+        self.assertEqual(LOGIC.body_mention_ids({"message_segment": cyclic}), set())
+
 
 class KeywordMatchingTests(unittest.TestCase):
     @staticmethod

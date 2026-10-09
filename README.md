@@ -6,7 +6,7 @@
 
 需要 **Neo-MoFox 1.2.0 或更新版本**，并启用内置 `default_chatter`。本插件没有额外的 Python 包依赖。
 
-把本项目放到 `Neo-MoFox/plugins/mofox_plugin_immersive_control/`，保证该目录直接包含 `manifest.json` 和 `plugin.py`。也可以解压 `dist/mofox_plugin_immersive_control-1.2.0.zip` 到 `Neo-MoFox/plugins/`。
+把本项目放到 `Neo-MoFox/plugins/mofox_plugin_immersive_control/`，保证该目录直接包含 `manifest.json` 和 `plugin.py`。也可以解压 `dist/mofox_plugin_immersive_control-1.2.1.zip` 到 `Neo-MoFox/plugins/`。
 
 发布本仓库的代码后，也可以在 Neo-MoFox 根目录运行：
 
@@ -30,6 +30,8 @@ config/plugins/mofox_plugin_immersive_control/config.toml
 | 退出 | `/拿出来吧`、`/停止控制`、`/结束控制`、`/停止`、`/td stop` | `@机器人 停止控制` |
 
 私聊也支持不加 `/`。群聊默认只有显式 `/关键词` 或 @机器人时才触发，避免普通聊天误触；`require_mention = false` 可以允许群聊无 @ 触发。
+
+支持适配器在消息开头附加的回复预览，包括 `[回复<…>：…]，说：`、`[回复:消息ID]`、`[回复]` 和 `「回复：…」`，可以与前置 @ 混用。只匹配预览后的正文，引用内容里的控制指令不会单独触发；引用里的 @ 不作为正文对机器人的提及。
 
 关键词支持后接空格和参数，退出关键词优先匹配。例如 `/td stop 现在` 会退出，`我想控制一下` 不会触发。进入和退出成功后交给 Neo-MoFox 正常聊天生成反应；机器人是否立即回复仍受框架的回复意愿、聊天调度及模型配置影响。状态会立即变更，不强制额外调用模型。
 
@@ -155,20 +157,24 @@ data/plugin_data/mofox_plugin_immersive_control/sessions.json
 
 退出提示按一次逻辑模型请求消费，同一次请求的内部重试会复用该提示；如果最终所有重试都失败，下一次请求会直接恢复正常状态。
 
+1.2.1 适配了 `dev` 每次模型尝试失败都发布失败事件的行为。退出/过载提示缓存按单次请求的策略会话隔离，成功时清理，请求结束或取消后自动释放；复用请求对象或 metadata 不会把旧提示带到下一次发送。由于当前公开事件没有逻辑请求 ID，`request_scope.py` 通过只读检查执行上下文定位作用域，不修改框架或关闭事件超时。
+
 当前适配和验证基于：
 
 - 原插件：`a46e4c9d82af32a1e712612565393c8ff13d092d`（2.3.6）。
-- Neo-MoFox：`e2ee2ff73b494428bbdfd983c7569c6f074a9c76`（1.2.0）。
+- Neo-MoFox 主分支：`e2ee2ff73b494428bbdfd983c7569c6f074a9c76`（1.2.0）。
+- Neo-MoFox `dev`：`0483c39ebcaf5c0b155ceb3a54af66190bed75ed`（核心 1.3.0-alpha.1，2026-10-09）。
 
 自定义 Chatter 必须提供等价的请求名称与会话 metadata 才能直接兼容；此版本明确面向内置 `default_chatter`。测试不调用真实模型或聊天平台，实际反应由所配置模型生成。
 
 ## 开发验证与打包
 
-状态和关键词测试只需 Python 3.11+ 标准库：
+状态、关键词和请求作用域测试只需 Python 3.11+ 标准库：
 
 ```shell
 python -m unittest discover -s tests -p test_state.py -v
 python -m unittest discover -s tests -p test_logic.py -v
+python -m unittest discover -s tests -p test_request_scope.py -v
 ```
 
 在安装了 Neo-MoFox 运行依赖的 Python 环境里，设置 `NEO_MOFOX_ROOT` 指向其源码目录，再运行全部测试：
@@ -178,7 +184,7 @@ $env:NEO_MOFOX_ROOT = "D:\Neo-MoFox"
 python -m unittest discover -s tests -v
 ```
 
-集成测试实际使用框架加载器、事件总线、配置模型、LLM payload 和命令管理器，以及临时 SQLite 权限库；发送适配器与模型调用用本地替身，不需要外部凭据。找不到 Neo-MoFox 源码时，集成测试会明确跳过；源码存在但依赖缺失时会报错。
+集成测试实际使用框架加载器、事件总线、消息转换器、配置模型、LLM payload 和命令管理器，以及临时 SQLite 权限库；发送适配器与模型调用用本地替身，不需要外部凭据。覆盖模型多次重试、重试耗尽、取消及共享 metadata 的请求隔离，也验证回复预览的命令识别。找不到 Neo-MoFox 源码时，集成测试会明确跳过；源码存在但依赖缺失时会报错。
 
 ```shell
 python scripts/build_release.py

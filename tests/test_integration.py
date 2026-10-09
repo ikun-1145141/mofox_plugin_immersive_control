@@ -47,6 +47,23 @@ class CapturingClient:
         return "captured offline response", [], None, None, None
 
 
+class BlockingFailureClient(CapturingClient):
+    """Hold an actual provider attempt while another logical request runs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def create(self, **kwargs):
+        if not self.calls:
+            self.calls.append(kwargs)
+            self.started.set()
+            await self.release.wait()
+            raise TimeoutError("offline provider timed out")
+        return await super().create(**kwargs)
+
+
 @unittest.skipUnless((NEO_ROOT / "src" / "core").is_dir(), "Neo-MoFox source is not available")
 class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
@@ -54,6 +71,7 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         sys.path.insert(0, str(NEO_ROOT))
         # Import failures are deliberately visible when source is available:
         # install the checkout's runtime dependencies rather than using stubs.
+        from mofox_wire import MessageEnvelope, SegPayload
         from src.app.plugin_system.api import adapter_api, send_api
         from src.core.components import loader, registry, state_manager
         from src.core.components.types import ComponentType, EventType, PermissionLevel
@@ -67,6 +85,7 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         from src.core.models.message import Message
         from src.core.models.sql_alchemy import Base, CommandPermissions, PermissionGroups
+        from src.core.transport.message_receive.converter import MessageConverter
         from src.kernel import db, event
         from src.kernel.llm import ROLE, LLMPayload, LLMRequest, LLMTimeoutError, Text
         from src.kernel.llm.model_client import ModelClientRegistry
@@ -98,6 +117,9 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
             Text=Text,
             adapter_api=adapter_api,
             send_api=send_api,
+            MessageConverter=MessageConverter,
+            MessageEnvelope=MessageEnvelope,
+            SegPayload=SegPayload,
         )
 
     @classmethod
@@ -109,6 +131,7 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         f = self.fw
         self.temporary = tempfile.TemporaryDirectory(prefix="immersive_neo_integration_")
         self.workdir = Path(self.temporary.name)
+        self.wire_envelopes: dict[object, dict] = {}
         self.old_cwd = Path.cwd()
         os.chdir(self.workdir)
         self.addCleanup(self.temporary.cleanup)
@@ -227,7 +250,9 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def receive(self, message):
-        envelope = {"message_info": {"message_id": message.message_id}, "unrelated": "preserved"}
+        envelope = self.wire_envelopes.get(
+            message, {"message_info": {"message_id": message.message_id}, "unrelated": "preserved"}
+        )
         params = {
             "message": message,
             "envelope": envelope,
@@ -239,6 +264,57 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(returned["envelope"], envelope)
         self.assertEqual(returned["adapter_signature"], "integration:adapter:offline")
         return decision
+
+    async def converted_message(
+        self,
+        body: str,
+        *,
+        preview: str = "An earlier message",
+        style: str = "adapter",
+        group: str = "converted-group",
+        sender: str = "operator",
+        mention: str | None = None,
+        quoted_mention: str | None = None,
+    ):
+        f = self.fw
+        quote_parts = [f.SegPayload(type="reply", data="quoted-message-id")]
+        if style == "adapter":
+            quote_parts.append(f.SegPayload(type="text", data="[回复<Quoted(quoted-user)>："))
+        if quoted_mention is not None:
+            quote_parts.append(f.SegPayload(type="at", data=f"Bot:{quoted_mention}"))
+        quote_parts.append(f.SegPayload(type="text", data=preview))
+        if style == "adapter":
+            # Match the real onebot adapter's reply preview segment layout.
+            quote_parts.append(f.SegPayload(type="text", data="]，说："))
+            quote = f.SegPayload(type="seglist", data=quote_parts)
+        else:
+            quote = f.SegPayload(type="reply", data=quote_parts)
+        segments = [quote]
+        if mention is not None:
+            segments.append(f.SegPayload(type="at", data=f"Bot:{mention}"))
+        segments.append(f.SegPayload(type="text", data=body))
+        envelope = f.MessageEnvelope(
+            direction="incoming",
+            message_info={
+                "platform": "test",
+                "message_id": "converted-message-id",
+                "time": self.clock.now,
+                "user_info": {
+                    "platform": "test",
+                    "user_id": sender,
+                    "user_nickname": "Converted operator",
+                },
+                "group_info": {"platform": "test", "group_id": group, "group_name": "Converted group"},
+            },
+            message_segment=segments,
+            raw_message={"unrelated": "wire data retained"},
+        )
+        message = await f.MessageConverter().envelope_to_message(envelope)
+        self.assertEqual(message.reply_to, "quoted-message-id")
+        self.assertEqual(message.extra["group_id"], group)
+        self.assertEqual(message.raw_data, envelope["raw_message"])
+        self.wire_envelopes[message] = envelope
+        return message
 
     async def request(self, stream: str | None, payloads=None, *, name="default_chatter"):
         f = self.fw
@@ -487,6 +563,211 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await request.send(auto_append_response=False, stream=False)
         self.assertEqual(len(client.calls), 2)
         self.assertNotIn("_mofox_immersive_exit_retry", request.meta_data)
+        first = self.transient_text(client.calls[0]["payloads"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(self.transient_text(client.calls[1]["payloads"]), first)
+        # A new send on the same builder and asyncio task is a new logical call.
+        await request.send(auto_append_response=False, stream=False)
+        self.assertEqual(len(client.calls), 3)
+        self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+        self.assertEqual(request.meta_data, {"stream_id": "group-a"})
+
+    async def test_multiple_provider_retries_preserve_complete_exit_and_overload_prompts(self) -> None:
+        self.plugin.config.prompts.exit_template = "EXIT level:{level} strength:{sensitivity}"
+        self.plugin.config.prompts.overload_template = "OVERLOAD voltage:{voltage} limit:{overload_voltage}"
+        for kind in ("exit", "overload"):
+            with self.subTest(kind=kind):
+                stream = "multiple-" + kind
+                if kind == "exit":
+                    await self.receive(self.message("/控制 4", stream=stream))
+                    await self.receive(self.message("/td stop", stream=stream))
+                    expected = "EXIT level:4 strength:75"
+                else:
+                    await self.receive(self.message("/电流 120", stream=stream))
+                    expected = "OVERLOAD voltage:120 limit:100"
+                client = CapturingClient(failures=2)
+                request = self.new_llm_request(client, max_retry=2)
+                request.meta_data["stream_id"] = stream
+                response = await request.send(auto_append_response=False, stream=False)
+                self.assertEqual(response.message, "captured offline response")
+                self.assertEqual(len(client.calls), 3)
+                first = self.transient_text(client.calls[0]["payloads"])
+                self.assertEqual(first, [MARKER + expected])
+                for call in client.calls[1:]:
+                    self.assertEqual(self.transient_text(call["payloads"]), first)
+                    self.assertIn("Permanent persona.", self.text(call["payloads"]))
+                    self.assertIn("History and unrelated extra instructions.", self.text(call["payloads"]))
+                self.assertEqual(request.meta_data, {"stream_id": stream})
+                await request.send(auto_append_response=False, stream=False)
+                self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+
+    async def test_exhausted_overload_retry_does_not_reappear_on_same_request_send(self) -> None:
+        self.plugin.config.prompts.overload_template = "OVERLOAD {voltage}/{overload_voltage}"
+        await self.receive(self.message("/电流 100"))
+        client = CapturingClient(failures=2)
+        request = self.new_llm_request(client, max_retry=1)
+        with self.assertRaises(self.fw.LLMTimeoutError):
+            await request.send(auto_append_response=False, stream=False)
+        self.assertEqual(len(client.calls), 2)
+        for call in client.calls:
+            self.assertEqual(self.transient_text(call["payloads"]), [MARKER + "OVERLOAD 100/100"])
+        self.assertEqual(request.meta_data, {"stream_id": "group-a"})
+        await request.send(auto_append_response=False, stream=False)
+        self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+
+    async def test_parallel_requests_sharing_metadata_do_not_share_consumed_exit_prompt(self) -> None:
+        self.plugin.config.prompts.exit_template = "ONLY_ORIGINAL_REQUEST_EXIT"
+        self.plugin.config.prompts.enter_template = "OTHER_STREAM_LEVEL:{level}"
+        await self.receive(self.message("/控制"))
+        await self.receive(self.message("/td stop"))
+        await self.receive(self.message("/控制 5", stream="group-b"))
+        client = BlockingFailureClient()
+        original = self.new_llm_request(client, max_retry=1)
+        original.model_set[0]["timeout"] = 0
+        pending = asyncio.create_task(original.send(auto_append_response=False, stream=False))
+        try:
+            await asyncio.wait_for(client.started.wait(), timeout=2)
+            other_client = CapturingClient()
+            other = self.new_llm_request(other_client)
+            other.meta_data = original.meta_data
+            self.assertIs(other.meta_data, original.meta_data)
+            await other.send(auto_append_response=False, stream=False)
+            self.assertEqual(self.transient_text(other_client.calls[-1]["payloads"]), [])
+            third_client = CapturingClient()
+            third = self.new_llm_request(third_client)
+            third.meta_data["stream_id"] = "group-b"
+            await third.send(auto_append_response=False, stream=False)
+            third_prompt = "\n".join(self.transient_text(third_client.calls[-1]["payloads"]))
+            self.assertIn("OTHER_STREAM_LEVEL:5", third_prompt)
+            self.assertNotIn("ONLY_ORIGINAL_REQUEST_EXIT", third_prompt)
+            client.release.set()
+            await pending
+            self.assertEqual(len(client.calls), 2)
+            for call in client.calls:
+                self.assertEqual(
+                    self.transient_text(call["payloads"]), [MARKER + "ONLY_ORIGINAL_REQUEST_EXIT"]
+                )
+            self.assertEqual(original.meta_data, {"stream_id": "group-a"})
+            await original.send(auto_append_response=False, stream=False)
+            self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+        finally:
+            client.release.set()
+            if not pending.done():
+                pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_provider_cancellation_cleans_exit_before_same_task_resends(self) -> None:
+        for kind in ("exit", "overload"):
+            with self.subTest(kind=kind):
+                stream = "cancelled-" + kind
+                if kind == "exit":
+                    await self.receive(self.message("/td", stream=stream))
+                    await self.receive(self.message("/td stop", stream=stream))
+                else:
+                    await self.receive(self.message("/电流 100", stream=stream))
+                client = BlockingFailureClient()
+                request = self.new_llm_request(client)
+                request.meta_data["stream_id"] = stream
+                request.model_set[0]["timeout"] = 0
+
+                async def cancel_then_resend() -> None:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await request.send(auto_append_response=False, stream=False)
+                    self.assertEqual(len(self.transient_text(client.calls[0]["payloads"])), 1)
+                    self.assertEqual(request.meta_data, {"stream_id": stream})
+                    await request.send(auto_append_response=False, stream=False)
+                    self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+
+                pending = asyncio.create_task(cancel_then_resend())
+                try:
+                    await asyncio.wait_for(client.started.wait(), timeout=2)
+                    pending.cancel()
+                    await pending
+                    self.assertEqual(len(client.calls), 2)
+                finally:
+                    client.release.set()
+                    if not pending.done():
+                        pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+
+    async def test_real_converter_reply_previews_allow_control_gear_electric_and_status_alias(self) -> None:
+        for style in ("adapter", "nested"):
+            with self.subTest(style=style):
+                group = "wire-commands-" + style
+                incoming = await self.converted_message("/控制 2", group=group, style=style)
+                extra_before = dict(incoming.extra)
+                self.assertEqual(await self.receive(incoming), self.fw.event.EventDecision.SUCCESS)
+                self.assertEqual(incoming.processed_plain_text, "控制 2")
+                self.assertEqual(incoming.extra, extra_before)
+                self.assertEqual((await self.plugin.store.get(incoming.stream_id)).level, 2)
+                gear = await self.converted_message("/档位 4", group=group, style=style)
+                self.assertEqual(await self.receive(gear), self.fw.event.EventDecision.STOP)
+                self.assertEqual((await self.plugin.store.get(incoming.stream_id)).level, 4)
+                electric = await self.converted_message("/电流 20", group=group, style=style)
+                self.assertEqual(await self.receive(electric), self.fw.event.EventDecision.STOP)
+                record = await self.plugin.store.get(incoming.stream_id)
+                self.assertEqual((record.level, record.voltage), (4, 20))
+                alias = await self.converted_message("/控制状态", group=group, style=style)
+                self.assertEqual(await self.receive(alias), self.fw.event.EventDecision.SUCCESS)
+                self.assertEqual(alias.processed_plain_text, "/imm_status")
+                success, result = await self.command_manager.execute_command(alias)
+                self.assertTrue(success, result)
+                self.assertIn("20V", self.transport.await_args.args[0].content)
+                self.assertEqual(self.transport.await_args.args[0].extra["target_group_id"], group)
+
+    async def test_real_converter_quoted_commands_never_trigger_from_ordinary_body(self) -> None:
+        for style in ("adapter", "nested"):
+            for quoted_command in ("/控制 2", "/档位 4", "/电流 100", "/控制状态", "/td stop"):
+                with self.subTest(style=style, quoted_command=quoted_command):
+                    incoming = await self.converted_message(
+                        "这是普通聊天，讨论前一条消息。", preview=quoted_command, style=style
+                    )
+                    before = incoming.processed_plain_text
+                    self.assertEqual(await self.receive(incoming), self.fw.event.EventDecision.PASS)
+                    self.assertEqual(incoming.processed_plain_text, before)
+                    self.assertIsNone(await self.plugin.store.get(incoming.stream_id))
+        self.transport.assert_not_awaited()
+        active = await self.converted_message("/电流 20")
+        await self.receive(active)
+        previous = await self.plugin.store.get(active.stream_id)
+        ordinary = await self.converted_message("这句话没有请求退出。", preview="/td stop")
+        self.assertEqual(await self.receive(ordinary), self.fw.event.EventDecision.PASS)
+        self.assertEqual(await self.plugin.store.get(active.stream_id), previous)
+
+    async def test_real_converter_reply_previews_preserve_mention_and_operator_gates(self) -> None:
+        with patch.object(
+            self.fw.adapter_api,
+            "get_bot_info_by_platform",
+            AsyncMock(return_value={"bot_id": "bot-123"}),
+        ):
+            for style in ("adapter", "nested"):
+                quoted_at = await self.converted_message("控制 2", quoted_mention="bot-123", style=style)
+                self.assertIn({"nickname": "Bot", "user_id": "bot-123"}, quoted_at.extra["at_users"])
+                self.assertEqual(await self.receive(quoted_at), self.fw.event.EventDecision.PASS)
+                self.assertIsNone(await self.plugin.store.get(quoted_at.stream_id))
+            for mention in (None, "wrong-bot"):
+                incoming = await self.converted_message(
+                    "控制 2", preview="@<Bot:bot-123> 控制", mention=mention
+                )
+                self.assertEqual(await self.receive(incoming), self.fw.event.EventDecision.PASS)
+                self.assertIsNone(await self.plugin.store.get(incoming.stream_id))
+            allowed = await self.converted_message("控制 2", mention="bot-123", sender="ordinary-user")
+            self.assertEqual(await self.receive(allowed), self.fw.event.EventDecision.SUCCESS)
+            self.assertIn({"nickname": "Bot", "user_id": "bot-123"}, allowed.extra["at_users"])
+            self.plugin.settings.admin_only_mode = True
+            denied = await self.converted_message("电流 30", mention="bot-123", sender="ordinary-user")
+            before = await self.plugin.store.get(allowed.stream_id)
+            self.assertEqual(await self.receive(denied), self.fw.event.EventDecision.STOP)
+            self.assertEqual(await self.plugin.store.get(allowed.stream_id), before)
+            self.assertIn("操作员", self.transport.await_args.args[0].content)
+            operator = await self.converted_message("电流 30", mention="bot-123", sender="operator")
+            self.assertEqual(await self.receive(operator), self.fw.event.EventDecision.STOP)
+            self.assertEqual((await self.plugin.store.get(operator.stream_id)).voltage, 30)
+            alias = await self.converted_message("/控制状态", sender="ordinary-user")
+            self.assertEqual(await self.receive(alias), self.fw.event.EventDecision.SUCCESS)
+            success, result = await self.command_manager.execute_command(alias)
+            self.assertFalse(success)
+            self.assertIn("权限", result)
 
     async def test_invalid_reload_keeps_admin_restriction_and_config_file(self) -> None:
         previous_config = self.plugin.config

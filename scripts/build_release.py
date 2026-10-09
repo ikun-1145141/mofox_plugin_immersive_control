@@ -10,6 +10,7 @@ FILES = (
     "plugin.py",
     "config.py",
     "handlers.py",
+    "request_scope.py",
     "commands.py",
     "logic.py",
     "state.py",

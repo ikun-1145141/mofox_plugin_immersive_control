@@ -1,7 +1,7 @@
 {
   "name": "mofox_plugin_immersive_control",
   "display_name": "沉浸式控制",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "AstrBot 沉浸式控制插件的 Neo-MoFox 移植版：五档调节、虚拟电流与过载剧情、限时互动、冷却、权限与持久化",
   "categories": ["fun"],
   "tags": ["roleplay", "immersive-control", "astrbot-port"],
