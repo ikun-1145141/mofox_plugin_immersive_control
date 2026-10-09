@@ -10,7 +10,16 @@ from src.app.plugin_system.types import ROLE, EventType, LLMPayload, Message, Pe
 from src.kernel.event import EventDecision
 
 from .config import DEFAULT_ENTER_TEMPLATE, DEFAULT_EXIT_TEMPLATE
-from .logic import match_control, normalize_message, render_prompt
+from .logic import (
+    describe_level,
+    effective_sensitivity,
+    entry_level,
+    level_name,
+    match_control,
+    normalize_message,
+    parse_gear_command,
+    render_prompt,
+)
 
 PROMPT_MARKER = "[mofox_immersive_control:transient]\n"
 _EXIT_RETRY_METADATA_KEY = "_mofox_immersive_exit_retry"
@@ -41,6 +50,15 @@ class ImmersiveMessageHandler(BaseEventHandler):
         if not settings.enabled:
             return EventDecision.PASS, params
         operation = match_control(normalized, settings.enter_keywords, settings.exit_keywords)
+        gear_request = None
+        input_error = None
+        if operation != "exit":
+            try:
+                gear_request = parse_gear_command(normalized)
+            except ValueError as error:
+                input_error = str(error)
+            if gear_request is not None or input_error:
+                operation = "gear"
         if operation is None:
             return EventDecision.PASS, params
         if message.chat_type == "group" and settings.require_mention and not explicit:
@@ -63,6 +81,40 @@ class ImmersiveMessageHandler(BaseEventHandler):
                 )
                 return EventDecision.STOP, params
 
+        if input_error:
+            await self.plugin.reply(input_error, message, params.get("adapter_signature"))
+            return EventDecision.STOP, params
+        if gear_request is not None:
+            kind, level = gear_request
+            record = await self.plugin.store.get(message.stream_id)
+            if not record or not record.active:
+                reply = (
+                    "当前未激活控制状态。先发送 /控制 或 /控制 2\n"
+                    f"默认{settings.default_level}档（{level_name(settings.default_level)}）；支持 1–5 档"
+                )
+            elif kind == "query":
+                reply = describe_level(record.level, settings.sensitivity, settings.level_multipliers)
+            else:
+                if kind in ("up", "down"):
+                    success, result, level = await self.plugin.store.shift_level(
+                        message.stream_id, 1 if kind == "up" else -1
+                    )
+                    reply = "档位已设置" if success else result
+                    if level is not None:
+                        reply += "\n" + describe_level(
+                            level, settings.sensitivity, settings.level_multipliers
+                        )
+                else:
+                    success, result = await self.plugin.store.set_level(message.stream_id, level)
+                    reply = (
+                        "档位已设置\n"
+                        + describe_level(level, settings.sensitivity, settings.level_multipliers)
+                        if success
+                        else result
+                    )
+            await self.plugin.reply(reply, message, params.get("adapter_signature"))
+            return EventDecision.STOP, params
+
         if operation == "exit":
             changed = await self.plugin.store.deactivate(message.stream_id)
             if not changed:
@@ -73,7 +125,12 @@ class ImmersiveMessageHandler(BaseEventHandler):
                     )
                     return EventDecision.STOP, params
         else:
-            success, result = await self.plugin.store.activate(message.stream_id)
+            try:
+                selected_level = entry_level(normalized, settings.enter_keywords, settings.default_level)
+            except ValueError as error:
+                await self.plugin.reply(str(error), message, params.get("adapter_signature"))
+                return EventDecision.STOP, params
+            success, result = await self.plugin.store.activate(message.stream_id, level=selected_level)
             if not success:
                 await self.plugin.reply(result, message, params.get("adapter_signature"))
                 return EventDecision.STOP, params
@@ -151,7 +208,14 @@ class ImmersivePromptHandler(BaseEventHandler):
             else:
                 return EventDecision.SUCCESS, params
             settings = self.plugin.settings
-            prompt = render_prompt(template, item_name=settings.item_name, sensitivity=settings.sensitivity)
+            sensitivity = effective_sensitivity(
+                settings.sensitivity, record.level, settings.level_multipliers
+            )
+            prompt = render_prompt(
+                template, item_name=settings.item_name, sensitivity=sensitivity, level=record.level
+            )
+            if record.active:
+                prompt += f"\n\n[当前档位：{record.level}/5（{level_name(record.level)}），本档反应强度：{sensitivity}%]"
             if not record.active:
                 # EventBus 浅拷贝顶层字典，meta_data 仍是同一逻辑请求的对象。
                 # 保留已消费的退出提示供 provider 重试；成功或重试耗尽即移除。

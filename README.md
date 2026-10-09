@@ -6,7 +6,7 @@
 
 需要 **Neo-MoFox 1.2.0 或更新版本**，并启用内置 `default_chatter`。本插件没有额外的 Python 包依赖。
 
-把本项目放到 `Neo-MoFox/plugins/mofox_plugin_immersive_control/`，保证该目录直接包含 `manifest.json` 和 `plugin.py`。也可以解压 `dist/mofox_plugin_immersive_control-1.0.0.zip` 到 `Neo-MoFox/plugins/`。
+把本项目放到 `Neo-MoFox/plugins/mofox_plugin_immersive_control/`，保证该目录直接包含 `manifest.json` 和 `plugin.py`。也可以解压 `dist/mofox_plugin_immersive_control-1.1.0.zip` 到 `Neo-MoFox/plugins/`。
 
 发布本仓库的代码后，也可以在 Neo-MoFox 根目录运行：
 
@@ -37,6 +37,31 @@ config/plugins/mofox_plugin_immersive_control/config.toml
 
 **同一群内所有成员共享一份状态与冷却**，不同群、私聊互相隔离。冷却从激活时开始计算，默认 30 秒；提前退出或消费退出提示不会绕过仍有效的冷却。
 
+## 档位调节
+
+从 1.1.0 起支持会话内 **1—5 档**，默认 3 档。基准敏感度 `sensitivity = 50` 时：
+
+| 档位 | 名称 | 默认倍率 | 实际反应强度 |
+| --- | --- | --- | --- |
+| 1 | 轻柔 | 0.2 | 10% |
+| 2 | 低档 | 0.6 | 30% |
+| 3 | 中档 | 1.0 | 50% |
+| 4 | 高档 | 1.5 | 75% |
+| 5 | 强档 | 2.0 | 100% |
+
+| 指令 | 作用 |
+| --- | --- |
+| `/控制 2`、`/td 2`、`/遥控 2` | 启动时指定 2 档 |
+| `/档位`、`/td level` | 查看当前档位和反应强度 |
+| `/档位 4`、`/调档 4`、`/td level 4` | 将当前会话切换到 4 档 |
+| `/升档`、`/降档` | 调高或调低一档，到 1、5 档时提示已到边界 |
+
+也接受 `3档` 或 `三档`。群聊无前缀调档需要 @机器人，权限规则与进入、退出一致。未激活时调档只提示用法，不会偷偷启动会话；`/td stop` 仍然优先执行退出。
+
+切档会立即更新当前会话的状态并反馈，下一次正常模型调用使用新档位。**切档不会续期或重置冷却**。同群共享档位，其他群和私聊不受影响，重启可恢复保存的档位。`/imm_status` 也会显示档位及强度。
+
+实际强度为 `sensitivity × 对应档位倍率`，取整后限制在 0—100。例如基准敏感度设为 80 时，4、5 档均达到 100%。保留基准敏感度配置，默认 3 档的效果与旧版相同。
+
 ## 管理命令
 
 以下命令要求 Neo-MoFox 的 `OPERATOR`（操作员）或 `OWNER`（所有者）权限。群管理员身份不自动等于机器人操作员；可使用框架的 `perm_plugin` 配置权限，或在核心配置中设置所有者。
@@ -64,18 +89,22 @@ max_concurrent = 10
 exit_pending_ttl = 86400
 item_name = "特殊装置"
 sensitivity = 50
+default_level = 3
+level_multipliers = [0.2, 0.6, 1.0, 1.5, 2.0]
 persist_state = true
 
 [prompts]
-# 空字符串使用原插件的默认模板；支持 {item_name} 和 {sensitivity}。
+# 空字符串使用原插件的默认模板；支持 {item_name}、{sensitivity}、{level}、{level_name}。
 enter_template = ""
 exit_template = ""
 ```
 
-- `admin_only_mode`：限制进入、退出操作为机器人操作员或所有者，管理命令始终需要权限。
+- `admin_only_mode`：限制进入、退出、查询档位和调档为机器人操作员或所有者，管理命令始终需要权限。
+- `default_level`：进入时没选档则使用此档位，范围 1—5；热重载不改变已激活会话的档位。
+- `level_multipliers`：依次对应五档，必须恰好五个有限数值，范围 0—10；模型实际使用的强度仍限制在 0—100。
 - `max_concurrent`：所有聊天同时激活的会话总数；到期的会话会释放名额。
 - `exit_pending_ttl`：退出后等待下一次模型请求的有效期，默认一天；离线期间也计算时间。
-- 自定义模板只替换两个指定变量，JSON 或其他花括号会保留。
+- 自定义模板只替换上述四个指定变量，`{sensitivity}` 为本档实际强度，`{level_name}` 为预设名称。JSON 或其他花括号会保留。控制中还会附加当前档位说明，因此旧模板也能表达档位变化。
 - 热重载会立即应用模板、关键词及限制；已有会话的到期与冷却时间保持原值。`enabled = false` 停止触发并清理后续模型请求中的旧注入；会话时间仍正常流逝。
 
 启用 `persist_state` 时，状态保存在 Neo-MoFox 根目录的：
@@ -84,7 +113,7 @@ exit_template = ""
 data/plugin_data/mofox_plugin_immersive_control/sessions.json
 ```
 
-进入、退出、消费退出提示和清空均使用原子文件替换写盘。重启按绝对时间恢复有效状态，损坏的状态文件会保留为 `.corrupt-*` 供排查。关闭持久化后只使用当前进程内存，旧磁盘快照不再更新；重新启用时建议执行 `/imm_clear` 清理不需要的旧状态。
+进入、退出、切档、消费退出提示和清空均使用原子文件替换写盘。旧版本没有档位字段的状态文件自动按 3 档读取。重启按绝对时间恢复有效状态，损坏的状态文件会保留为 `.corrupt-*` 供排查。关闭持久化后只使用当前进程内存，旧磁盘快照不再更新；重新启用时建议执行 `/imm_clear` 清理不需要的旧状态。
 
 ## 移植范围和兼容性
 

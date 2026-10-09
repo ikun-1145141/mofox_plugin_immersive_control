@@ -9,6 +9,8 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 
+from .logic import describe_level
+
 logger = get_logger("immersive_commands")
 
 
@@ -39,6 +41,8 @@ class ImmStatusCommand(_AdminCommand):
         lines = [f"控制状态: {'激活中' if record and record.active else '未激活'}"]
         now = self.plugin.store.clock()
         if record:
+            settings = self.plugin.settings
+            lines.append(describe_level(record.level, settings.sensitivity, settings.level_multipliers))
             if record.active and record.end is not None:
                 lines.append(f"剩余时间: {max(0, math.ceil(record.end - now))}秒")
             elif record.exit_ts is not None:

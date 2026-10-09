@@ -84,6 +84,20 @@ class KeywordMatchingTests(unittest.TestCase):
 
 
 class PromptRenderingTests(unittest.TestCase):
+    def test_gear_placeholders_preserve_json_and_unknown_braces(self):
+        template = (
+            '{"device": "{item_name}", "gear": {level}, "name": "{level_name}", '
+            '"intensity": {sensitivity}, "data": {"x": 1}}\n{unknown}'
+        )
+        self.assertEqual(
+            LOGIC.render_prompt(template, item_name="装置", sensitivity=75, level=4),
+            '{"device": "装置", "gear": 4, "name": "高档", "intensity": 75, "data": {"x": 1}}\n{unknown}',
+        )
+        self.assertEqual(
+            LOGIC.render_prompt("{level}: {level_name}", item_name="装置", sensitivity=50),
+            "3: 中档",
+        )
+
     def test_only_supported_placeholders_are_replaced_and_json_braces_survive(self):
         template = '{"item": "{item_name}", "level": {sensitivity}, "data": {"x": 1}}\n{unknown} {item_name}'
         rendered = LOGIC.render_prompt(template, item_name="魔法装置", sensitivity=75)
@@ -98,6 +112,96 @@ class PromptRenderingTests(unittest.TestCase):
             LOGIC.render_prompt('{"nested": {"ok": true}}', item_name="装置", sensitivity=100),
             '{"nested": {"ok": true}}',
         )
+
+
+class GearParsingTests(unittest.TestCase):
+    def test_levels_accept_one_through_five_and_chinese_suffixes(self):
+        for level in range(1, 6):
+            for value in (str(level), f"{level}档", "一二三四五"[level - 1] + "档"):
+                with self.subTest(value=value):
+                    self.assertEqual(LOGIC.parse_level(value), level)
+        self.assertEqual(LOGIC.parse_level("三"), 3)
+
+    def test_invalid_level_text_and_extra_arguments_raise_helpful_error(self):
+        for value in ("0", "6", "-1", "2.5", "true", "False", "3 now", "三档 extra", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "1–5"):
+                LOGIC.parse_level(value)
+
+    def test_queries_and_sets_accept_all_gear_command_aliases(self):
+        for keyword in ("档位", "调档", "td level"):
+            with self.subTest(keyword=keyword):
+                self.assertEqual(LOGIC.parse_gear_command(keyword), ("query", None))
+                self.assertEqual(LOGIC.parse_gear_command(f"{keyword} 2"), ("set", 2))
+                self.assertEqual(LOGIC.parse_gear_command(f"{keyword} 四档"), ("set", 4))
+                with self.assertRaisesRegex(ValueError, "1–5"):
+                    LOGIC.parse_gear_command(f"{keyword} 2 extra")
+
+    def test_step_commands_and_invalid_arguments(self):
+        self.assertEqual(LOGIC.parse_gear_command("升档"), ("up", None))
+        self.assertEqual(LOGIC.parse_gear_command("降档"), ("down", None))
+        for command in ("升档 2", "降档 now"):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, "无需附加参数"):
+                LOGIC.parse_gear_command(command)
+
+    def test_stop_is_classified_as_exit_and_never_as_a_gear_command(self):
+        for message in ("/td stop", "@<机器人:100> /td stop now"):
+            text, _ = LOGIC.normalize_message(message)
+            with self.subTest(message=message):
+                self.assertEqual(LOGIC.match_control(text, ["td"], ["td stop"]), "exit")
+                self.assertIsNone(LOGIC.parse_gear_command(text))
+        for text in ("td levelheaded", "普通消息", "查询档位", "档位器"):
+            with self.subTest(text=text):
+                self.assertIsNone(LOGIC.parse_gear_command(text))
+
+    def test_longest_custom_enter_keyword_keeps_selected_numeric_level(self):
+        for keywords in (["control", "control mode"], ["/control mode", "/control"]):
+            with self.subTest(keywords=keywords):
+                self.assertEqual(LOGIC.entry_level("control mode 2", keywords, 3), 2)
+                self.assertEqual(LOGIC.entry_level("control mode 三档", keywords, 1), 3)
+                self.assertEqual(LOGIC.entry_level("control mode 档位 4", keywords, 3), 4)
+
+    def test_scene_descriptions_keep_configured_default_level(self):
+        for text in ("控制", "控制 从远处按下按钮", "控制 慢慢开始", "control mode 按下遥控器"):
+            with self.subTest(text=text):
+                self.assertEqual(LOGIC.entry_level(text, ["控制", "control", "control mode"], 3), 3)
+        self.assertEqual(LOGIC.entry_level("控制 描述情境", ["控制"], 2), 2)
+
+    def test_explicit_invalid_entry_level_does_not_fall_back_to_default(self):
+        for text in ("控制 0", "控制 6", "控制 2.5", "控制 档位 6", "控制 六档", "控制 两档"):
+            with self.subTest(text=text), self.assertRaisesRegex(ValueError, "1–5"):
+                LOGIC.entry_level(text, ["控制"], 3)
+        with self.assertRaisesRegex(ValueError, "请指定档位"):
+            LOGIC.entry_level("控制 档位", ["控制"], 3)
+
+
+class GearSensitivityTests(unittest.TestCase):
+    MULTIPLIERS = (0.2, 0.6, 1.0, 1.5, 2.0)
+
+    def test_default_base_maps_all_five_levels_to_expected_strength(self):
+        self.assertEqual(
+            [LOGIC.effective_sensitivity(50, level, self.MULTIPLIERS) for level in range(1, 6)],
+            [10, 30, 50, 75, 100],
+        )
+
+    def test_strength_clamps_at_one_hundred_and_zero_base_stays_zero(self):
+        self.assertEqual(
+            [LOGIC.effective_sensitivity(80, level, self.MULTIPLIERS) for level in range(1, 6)],
+            [16, 48, 80, 100, 100],
+        )
+        self.assertEqual(
+            [LOGIC.effective_sensitivity(0, level, self.MULTIPLIERS) for level in range(1, 6)],
+            [0, 0, 0, 0, 0],
+        )
+
+    def test_level_names_and_feedback_agree_with_strength_calculation(self):
+        self.assertEqual([LOGIC.level_name(level) for level in range(1, 6)], list(LOGIC.LEVEL_NAMES))
+        self.assertEqual(
+            LOGIC.describe_level(4, 50, self.MULTIPLIERS),
+            "当前档位: 4/5（高档）\n反应强度: 75%",
+        )
+        for level in (True, 0, 6, 1.0):
+            with self.subTest(level=level), self.assertRaises(ValueError):
+                LOGIC.effective_sensitivity(50, level, self.MULTIPLIERS)
 
 
 if __name__ == "__main__":

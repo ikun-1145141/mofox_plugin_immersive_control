@@ -37,6 +37,7 @@ class Session:
     exit_ts: float | None = None
     reason: str | None = None
     cooldown_end: float = 0.0
+    level: int = 3
 
 
 class SessionStore:
@@ -122,6 +123,10 @@ class SessionStore:
             raise ValueError(f"non-finite {field}")
         return result
 
+    @staticmethod
+    def _valid_level(level: object) -> bool:
+        return type(level) is int and 1 <= level <= 5
+
     @classmethod
     def _decode(cls, payload: str) -> dict[str, Session]:
         document = json.loads(payload)
@@ -147,7 +152,10 @@ class SessionStore:
                 raise ValueError("invalid exit reason")
             if active and (end is None or exit_ts is not None):
                 raise ValueError("invalid active session timestamps")
-            decoded[key] = Session(active, end, exit_ts, reason, float(cooldown_end))
+            level = record.get("level", 3)
+            if not cls._valid_level(level):
+                raise ValueError("invalid session level")
+            decoded[key] = Session(active, end, exit_ts, reason, float(cooldown_end), level)
         return decoded
 
     @staticmethod
@@ -201,12 +209,14 @@ class SessionStore:
             session = self._data.get(key)
             return replace(session) if session is not None else None
 
-    async def activate(self, key: str) -> tuple[bool, str]:
+    async def activate(self, key: str, level: int = 3) -> tuple[bool, str]:
         async with self._lock:
             now = float(self.clock())
             changed = self._sweep(now)
             current = self._data.get(key)
-            if current is not None and current.active:
+            if not self._valid_level(level):
+                result = (False, "档位必须是 1–5 的整数")
+            elif current is not None and current.active:
                 result = (False, "控制状态已激活")
             elif current is not None and current.cooldown_end > now:
                 remaining = math.ceil(current.cooldown_end - now)
@@ -218,9 +228,50 @@ class SessionStore:
                     active=True,
                     end=now + self.cfg.state_duration,
                     cooldown_end=now + self.cfg.cooldown_seconds,
+                    level=level,
                 )
                 changed = True
                 result = (True, "ok")
+            if changed:
+                await self._save_locked()
+            return result
+
+    async def set_level(self, key: str, level: int) -> tuple[bool, str]:
+        """Change an active session's level without extending its deadlines."""
+        async with self._lock:
+            changed = self._sweep(float(self.clock()))
+            session = self._data.get(key)
+            if not self._valid_level(level):
+                result = (False, "档位必须是 1–5 的整数")
+            elif session is None or not session.active:
+                result = (False, "当前未激活控制状态")
+            else:
+                if session.level != level:
+                    self._data[key] = replace(session, level=level)
+                    changed = True
+                result = (True, "ok")
+            if changed:
+                await self._save_locked()
+            return result
+
+    async def shift_level(self, key: str, delta: int) -> tuple[bool, str, int | None]:
+        """Apply one relative gear step atomically, including its bounds check."""
+        async with self._lock:
+            changed = self._sweep(float(self.clock()))
+            session = self._data.get(key)
+            if type(delta) is not int or delta not in (-1, 1):
+                result = (False, "升降档参数必须是 -1 或 1 的整数", None)
+            elif session is None or not session.active:
+                result = (False, "当前未激活控制状态", None)
+            elif session.level + delta > 5:
+                result = (False, "已经是最高档", session.level)
+            elif session.level + delta < 1:
+                result = (False, "已经是最低档", session.level)
+            else:
+                level = session.level + delta
+                self._data[key] = replace(session, level=level)
+                changed = True
+                result = (True, "ok", level)
             if changed:
                 await self._save_locked()
             return result

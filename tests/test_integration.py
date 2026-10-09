@@ -7,8 +7,10 @@ mock is send_api.send_message; command permissions use a temporary SQLite DB.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -131,6 +133,7 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         await f.db.reset_session_factory()
         await f.db.reset_engine_state()
+        f.db.reset_db_cache()
         f.db.configure_engine("sqlite+aiosqlite:///:memory:", apply_optimizations=False)
         engine = await f.db.get_engine()
         async with engine.begin() as connection:
@@ -145,6 +148,12 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
             person_id=permission_manager.generate_person_id("test", "operator"),
             level=f.PermissionLevel.OPERATOR,
             reason="Offline integration fixture",
+        )
+        self.assertEqual(
+            await permission_manager.get_user_permission_level(
+                permission_manager.generate_person_id("test", "operator")
+            ),
+            f.PermissionLevel.OPERATOR,
         )
         self.manager = f.plugin_manager.get_plugin_manager()
         self.bus = f.event.get_event_bus()
@@ -193,6 +202,7 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(await self.manager.unload_plugin(self.plugin_name))
         await self.fw.db.reset_session_factory()
         await self.fw.db.reset_engine_state()
+        self.fw.db.reset_db_cache()
 
     def message(
         self,
@@ -567,6 +577,244 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.transient_text(await self.request("group-disabled")), [])
         self.assertEqual(self.transient_text(await self.request("group-a", inherited)), [])
         self.assertIn("Existing persona", self.text(await self.request("group-a", inherited)))
+
+    async def test_gear_default_preserves_legacy_sensitivity_and_honors_config(self) -> None:
+        self.assertEqual(self.plugin.settings.default_level, 3)
+        self.assertEqual(self.plugin.settings.level_multipliers, [0.2, 0.6, 1.0, 1.5, 2.0])
+        config_path = self.workdir / "config" / "plugins" / self.plugin_name / "config.toml"
+        generated = config_path.read_text(encoding="utf-8")
+        self.assertIn("default_level", generated)
+        self.assertIn("level_multipliers", generated)
+        self.plugin.config.prompts.enter_template = "LEVEL:{level} NAME:{level_name} EFFECTIVE:{sensitivity}"
+        await self.receive(self.message("/td"))
+        self.assertEqual((await self.plugin.store.get("group-a")).level, 3)
+        self.assertIn("LEVEL:3 NAME:中档 EFFECTIVE:50", self.transient_text(await self.request("group-a"))[0])
+        self.plugin.settings.default_level = 4
+        await self.receive(self.message("/td", stream="configured-default"))
+        self.assertEqual((await self.plugin.store.get("configured-default")).level, 4)
+        self.assertIn(
+            "LEVEL:4 NAME:高档 EFFECTIVE:75",
+            self.transient_text(await self.request("configured-default"))[0],
+        )
+
+    async def test_gear_change_replaces_provider_prompt_immediately_and_clamps_sensitivity(self) -> None:
+        self.plugin.config.prompts.enter_template = "LEVEL:{level} NAME:{level_name} EFFECTIVE:{sensitivity}"
+        client = CapturingClient()
+        request = self.new_llm_request(client)
+        await self.receive(self.message("/控制 2"))
+        await request.send(auto_append_response=False, stream=False)
+        first = self.transient_text(client.calls[-1]["payloads"])
+        self.assertEqual(len(first), 1)
+        self.assertIn("LEVEL:2 NAME:低档 EFFECTIVE:30", first[0])
+        await self.receive(self.message("/档位 4", sender="another-group-member"))
+        await request.send(auto_append_response=False, stream=False)
+        second = self.transient_text(client.calls[-1]["payloads"])
+        self.assertEqual(len(second), 1)
+        self.assertIn("LEVEL:4 NAME:高档 EFFECTIVE:75", second[0])
+        self.assertNotIn("LEVEL:2", second[0])
+        self.assertIn("Permanent persona.", self.text(client.calls[-1]["payloads"]))
+        self.assertIn("History and unrelated extra instructions.", self.text(client.calls[-1]["payloads"]))
+        self.plugin.settings.sensitivity = 80
+        await self.receive(self.message("/档位 5"))
+        await request.send(auto_append_response=False, stream=False)
+        self.assertIn("LEVEL:5 NAME:强档 EFFECTIVE:100", self.transient_text(client.calls[-1]["payloads"])[0])
+        self.assertEqual(len(client.calls), 3)
+
+    async def test_gear_aliases_query_and_boundaries_preserve_active_state(self) -> None:
+        await self.receive(self.message("/td 5", sender="ordinary-user"))
+        original = await self.plugin.store.get("group-a")
+        self.assertEqual(original.level, 5)
+        for query in ("/档位", "/td level"):
+            with self.subTest(query=query):
+                before = self.transport.await_count
+                await self.receive(self.message(query, sender="ordinary-user"))
+                self.assertEqual(self.transport.await_count, before + 1)
+                self.assertIn("5", self.transport.await_args.args[0].content)
+                self.assertIn("强档", self.transport.await_args.args[0].content)
+                self.assertEqual(await self.plugin.store.get("group-a"), original)
+        for command, expected in (
+            ("/td level 2", 2),
+            ("/升档", 3),
+            ("/降档", 2),
+            ("/调档 1", 1),
+            ("/降档", 1),
+            ("/档位 5", 5),
+            ("/升档", 5),
+        ):
+            with self.subTest(command=command):
+                await self.receive(self.message(command, sender="ordinary-user"))
+                current = await self.plugin.store.get("group-a")
+                self.assertEqual(current.level, expected)
+                self.assertEqual(current.end, original.end)
+                self.assertEqual(current.cooldown_end, original.cooldown_end)
+        success, result = await self.command_manager.execute_command(self.message("/imm_status"))
+        self.assertTrue(success, result)
+        self.assertIn("档位", result)
+        self.assertIn("强档", result)
+
+    async def test_gear_changes_do_not_extend_deadlines_or_reactivate_expired_sessions(self) -> None:
+        await self.receive(self.message("/td 2"))
+        original = await self.plugin.store.get("group-a")
+        self.clock.now += 10
+        await self.receive(self.message("/调档 5"))
+        updated = await self.plugin.store.get("group-a")
+        self.assertEqual(updated.level, 5)
+        self.assertEqual(updated.end, original.end)
+        self.assertEqual(updated.cooldown_end, original.cooldown_end)
+        self.clock.now = original.cooldown_end + 1
+        await self.receive(self.message("/档位 4"))
+        changed_again = await self.plugin.store.get("group-a")
+        self.assertEqual(changed_again.level, 4)
+        self.assertEqual(changed_again.end, original.end)
+        self.assertEqual(changed_again.cooldown_end, original.cooldown_end)
+        self.clock.now = original.end + 1
+        await self.receive(self.message("/升档"))
+        expired = await self.plugin.store.get("group-a")
+        self.assertFalse(expired.active)
+        self.assertEqual(expired.level, 4)
+        self.assertEqual(expired.end, original.end)
+        self.assertIn("已结束", self.transient_text(await self.request("group-a"))[0])
+        self.assertEqual(self.transient_text(await self.request("group-a")), [])
+
+    async def test_gear_concurrent_up_commands_apply_both_increments_without_extending_state(self) -> None:
+        await self.receive(self.message("/td"))
+        original = await self.plugin.store.get("group-a")
+        self.assertEqual(original.level, 3)
+        tasks = []
+        try:
+            # Queue both real handlers behind the real state lock, as can happen
+            # while another session is persisted. A get-then-set handler loses
+            # an increment here; an atomic shift applies both operations.
+            async with self.plugin.store._lock:
+                tasks = [
+                    asyncio.create_task(self.receive(self.message("/升档", sender="member-1"))),
+                    asyncio.create_task(self.receive(self.message("/升档", sender="member-2"))),
+                ]
+                for _ in range(40):
+                    waiters = getattr(self.plugin.store._lock, "_waiters", None) or ()
+                    if len(waiters) >= 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertGreaterEqual(len(waiters), 2, "Both handlers must be waiting before release")
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        changed = await self.plugin.store.get("group-a")
+        self.assertEqual(changed.level, 5)
+        self.assertEqual(changed.end, original.end)
+        self.assertEqual(changed.cooldown_end, original.cooldown_end)
+        self.assertEqual(self.transport.await_count, 2)
+
+    async def test_gear_values_are_shared_within_one_stream_and_isolated_between_streams(self) -> None:
+        await self.receive(self.message("/控制 2", sender="member-1"))
+        await self.receive(self.message("/控制 5", stream="group-b", sender="member-2"))
+        await self.receive(self.message("/档位 4", sender="member-3"))
+        self.assertEqual((await self.plugin.store.get("group-a")).level, 4)
+        self.assertEqual((await self.plugin.store.get("group-b")).level, 5)
+        self.assertEqual(self.transient_text(await self.request("group-c")), [])
+        await self.receive(self.message("/td level", stream="group-b", sender="member-4"))
+        self.assertIn("强档", self.transport.await_args.args[0].content)
+        self.assertIn("高档", self.transient_text(await self.request("group-a"))[0])
+        self.assertIn("强档", self.transient_text(await self.request("group-b"))[0])
+
+    async def test_gear_invalid_levels_and_inactive_adjustments_never_activate_sessions(self) -> None:
+        for command in (
+            "/控制 0",
+            "/td 6",
+            "/控制 档位",
+            "/控制 六档",
+            "/控制 两档",
+            "/档位 4",
+            "/升档",
+            "/降档",
+            "/td level 0",
+        ):
+            with self.subTest(command=command):
+                before = self.transport.await_count
+                await self.receive(self.message(command))
+                self.assertEqual(self.transport.await_count, before + 1)
+                self.assertIsNone(await self.plugin.store.get("group-a"))
+                self.assertEqual(self.transient_text(await self.request("group-a")), [])
+        await self.receive(self.message("/td 2"))
+        original = await self.plugin.store.get("group-a")
+        for command in ("/档位 0", "/调档 6", "/td level 6"):
+            await self.receive(self.message(command))
+            self.assertEqual(await self.plugin.store.get("group-a"), original)
+
+    async def test_gear_query_and_change_obey_real_admin_only_permissions(self) -> None:
+        await self.receive(self.message("/td 2"))
+        self.plugin.settings.admin_only_mode = True
+        original = await self.plugin.store.get("group-a")
+        for command in ("/档位", "/档位 4", "/td level", "/升档"):
+            with self.subTest(command=command):
+                decision = await self.receive(self.message(command, sender="ordinary-user"))
+                self.assertEqual(decision, self.fw.event.EventDecision.STOP)
+                self.assertIn("操作员", self.transport.await_args.args[0].content)
+                self.assertEqual(await self.plugin.store.get("group-a"), original)
+        await self.receive(self.message("/档位 4", sender="operator"))
+        self.assertEqual((await self.plugin.store.get("group-a")).level, 4)
+        await self.receive(self.message("/档位", sender="operator"))
+        self.assertIn("高档", self.transport.await_args.args[0].content)
+
+    async def test_gear_group_query_and_change_require_correct_bot_mention(self) -> None:
+        await self.receive(self.message("/td 2"))
+        with patch.object(
+            self.fw.adapter_api,
+            "get_bot_info_by_platform",
+            AsyncMock(return_value={"bot_id": "bot-123"}),
+        ):
+            for text, at_users in (
+                ("档位 4", []),
+                ("档位", []),
+                ("@<Other:other-id> 档位 4", [{"user_id": "other-id"}]),
+                ("@<Other:other-id> 档位", [{"user_id": "other-id"}]),
+            ):
+                before = self.transport.await_count
+                await self.receive(self.message(text, at_users=at_users))
+                self.assertEqual(self.transport.await_count, before)
+                self.assertEqual((await self.plugin.store.get("group-a")).level, 2)
+            mentioned = self.message("@<Robot:bot-123> 档位 4", at_users=[{"user_id": "bot-123"}])
+            await self.receive(mentioned)
+            self.assertEqual((await self.plugin.store.get("group-a")).level, 4)
+            self.assertEqual(mentioned.extra["at_users"], [{"user_id": "bot-123"}])
+            await self.receive(self.message("@<Robot:bot-123> 档位", at_users=[{"user_id": "bot-123"}]))
+            self.assertIn("高档", self.transport.await_args.args[0].content)
+        await self.receive(self.message("/降档"))
+        self.assertEqual((await self.plugin.store.get("group-a")).level, 3)
+
+    async def test_gear_native_config_rejects_invalid_bounds_and_multiplier_values(self) -> None:
+        config_class = type(self.plugin.config)
+        for values in (
+            {"default_level": 0},
+            {"default_level": 6},
+            {"level_multipliers": [0.2, 0.6, 1.0, 1.5]},
+            {"level_multipliers": [0.2, 0.6, 1.0, 1.5, 2.0, 3.0]},
+            {"level_multipliers": [0.2, 0.6, -1.0, 1.5, 2.0]},
+            {"level_multipliers": [0.2, 0.6, float("nan"), 1.5, 2.0]},
+            {"level_multipliers": [0.2, 0.6, float("inf"), 1.5, 2.0]},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                config_class.model_validate({"plugin": values})
+        config_path = self.workdir / "config" / "plugins" / self.plugin_name / "config.toml"
+        original_file = config_path.read_text(encoding="utf-8")
+        original_config = self.plugin.config
+        for replacement in ("[0.2, 0.6, 1.0, 1.5]", "[0.2, 0.6, -1.0, 1.5, 2.0]"):
+            with self.subTest(replacement=replacement):
+                invalid_file = re.sub(
+                    r"(?m)^level_multipliers\s*=.*$",
+                    "level_multipliers = " + replacement,
+                    original_file,
+                    count=1,
+                )
+                self.assertNotEqual(invalid_file, original_file)
+                config_path.write_text(invalid_file, encoding="utf-8")
+                success, result = await self.command_manager.execute_command(self.message("/imm_reload"))
+                self.assertFalse(success, result)
+                self.assertIs(self.plugin.config, original_config)
+                self.assertEqual(config_path.read_text(encoding="utf-8"), invalid_file)
 
 
 if __name__ == "__main__":

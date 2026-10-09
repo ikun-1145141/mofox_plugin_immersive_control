@@ -1,7 +1,8 @@
 """Neo-MoFox 原生 TOML / WebUI 配置。"""
 
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
+from pydantic import FiniteFloat
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
 from .prompts import DEFAULT_ENTER_TEMPLATE, DEFAULT_EXIT_TEMPLATE
@@ -39,7 +40,20 @@ class ImmersiveControlConfig(BaseConfig):
             default=86400, ge=1, description="退出提示等待下一次模型请求的最长时间（秒）"
         )
         item_name: str = Field(default="特殊装置", min_length=1, description="提示词中的装置名称")
-        sensitivity: int = Field(default=50, ge=0, le=100, description="角色反应敏感度（0—100）")
+        sensitivity: int = Field(default=50, ge=0, le=100, description="基准敏感度，默认对应 3 档（0—100）")
+        default_level: int = Field(
+            default=3, ge=1, le=5, strict=True, description="未指定时使用的控制档位（1—5）"
+        )
+        level_multipliers: list[Annotated[FiniteFloat, Field(ge=0, le=10, strict=True)]] = Field(
+            default_factory=lambda: [0.2, 0.6, 1.0, 1.5, 2.0],
+            min_length=5,
+            max_length=5,
+            description="依次对应 1—5 档的敏感度倍率，实际敏感度限制在 0—100",
+            input_type="list",
+            item_type="number",
+            min_items=5,
+            max_items=5,
+        )
         persist_state: bool = Field(default=True, description="将会话状态和冷却持久化，支持重启恢复")
 
     @config_section("prompts")
@@ -47,10 +61,12 @@ class ImmersiveControlConfig(BaseConfig):
         """可自定义模板，留空使用默认模板。"""
 
         enter_template: str = Field(
-            default=DEFAULT_ENTER_TEMPLATE, description="进入和持续控制模板，支持 {item_name}、{sensitivity}"
+            default=DEFAULT_ENTER_TEMPLATE,
+            description="进入和持续控制模板，支持 {item_name}、{sensitivity}、{level}、{level_name}",
         )
         exit_template: str = Field(
-            default=DEFAULT_EXIT_TEMPLATE, description="退出模板，支持 {item_name}、{sensitivity}"
+            default=DEFAULT_EXIT_TEMPLATE,
+            description="退出模板，支持 {item_name}、{sensitivity}、{level}、{level_name}",
         )
 
     plugin: PluginSection = Field(default_factory=PluginSection)
