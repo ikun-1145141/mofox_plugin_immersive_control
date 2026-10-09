@@ -816,6 +816,304 @@ class FrameworkIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(self.plugin.config, original_config)
                 self.assertEqual(config_path.read_text(encoding="utf-8"), invalid_file)
 
+    async def test_electric_provider_receives_voltage_changes_and_mode_off_immediately(self) -> None:
+        self.plugin.config.prompts.enter_template = "TEST_CONTROL LEVEL:{level}"
+        self.plugin.config.prompts.electric_template = "TEST_ELECTRIC V:{voltage} LIMIT:{overload_voltage}"
+        client = CapturingClient()
+        request = self.new_llm_request(client)
+        await self.receive(self.message("/电流 20"))
+        original = await self.plugin.store.get("group-a")
+        self.assertTrue(original.active)
+        self.assertEqual(original.voltage, 20)
+        await request.send(auto_append_response=False, stream=False)
+        captured = "\n".join(self.transient_text(client.calls[-1]["payloads"]))
+        self.assertIn("TEST_CONTROL LEVEL:3", captured)
+        self.assertIn("TEST_ELECTRIC V:20 LIMIT:100", captured)
+        self.assertIn("Permanent persona.", self.text(client.calls[-1]["payloads"]))
+        self.assertIn("History and unrelated extra instructions.", self.text(client.calls[-1]["payloads"]))
+        await self.receive(self.message("/加压"))
+        self.assertEqual((await self.plugin.store.get("group-a")).voltage, 30)
+        await request.send(auto_append_response=False, stream=False)
+        captured = "\n".join(self.transient_text(client.calls[-1]["payloads"]))
+        self.assertIn("TEST_ELECTRIC V:30 LIMIT:100", captured)
+        self.assertNotIn("TEST_ELECTRIC V:20", captured)
+        await self.receive(self.message("/td voltage 45"))
+        await request.send(auto_append_response=False, stream=False)
+        captured = "\n".join(self.transient_text(client.calls[-1]["payloads"]))
+        self.assertIn("TEST_ELECTRIC V:45 LIMIT:100", captured)
+        self.assertNotIn("TEST_ELECTRIC V:30", captured)
+        await self.receive(self.message("/断电"))
+        switched_off = await self.plugin.store.get("group-a")
+        self.assertTrue(switched_off.active)
+        self.assertIsNone(switched_off.voltage)
+        self.assertEqual(switched_off.end, original.end)
+        self.assertEqual(switched_off.cooldown_end, original.cooldown_end)
+        await request.send(auto_append_response=False, stream=False)
+        captured = "\n".join(self.transient_text(client.calls[-1]["payloads"]))
+        self.assertIn("TEST_CONTROL LEVEL:3", captured)
+        self.assertNotIn("TEST_ELECTRIC", captured)
+        await self.receive(self.message("/电压 50"))
+        await request.send(auto_append_response=False, stream=False)
+        self.assertIn(
+            "TEST_ELECTRIC V:50 LIMIT:100",
+            "\n".join(self.transient_text(client.calls[-1]["payloads"])),
+        )
+
+    async def test_electric_aliases_queries_and_zero_voltage_preserve_control_deadlines(self) -> None:
+        self.assertEqual(self.plugin.settings.default_voltage, 10)
+        self.assertEqual(self.plugin.settings.voltage_step, 10)
+        self.assertEqual(self.plugin.settings.overload_voltage, 100)
+        await self.receive(self.message("/td electric", sender="ordinary-user"))
+        original = await self.plugin.store.get("group-a")
+        self.assertEqual(original.voltage, 10)
+        for query in ("/电压", "/td voltage"):
+            before = self.transport.await_count
+            await self.receive(self.message(query, sender="ordinary-user"))
+            self.assertEqual(self.transport.await_count, before + 1)
+            self.assertIn("10", self.transport.await_args.args[0].content)
+            self.assertEqual(await self.plugin.store.get("group-a"), original)
+        for command, expected in (
+            ("/td electric 40", 40),
+            ("/电压 25", 25),
+            ("/减压", 15),
+            ("/减压 5", 10),
+            ("/加压 20", 30),
+            ("/电压 0", 0),
+        ):
+            with self.subTest(command=command):
+                await self.receive(self.message(command, sender="ordinary-user"))
+                changed = await self.plugin.store.get("group-a")
+                self.assertTrue(changed.active)
+                self.assertEqual(changed.voltage, expected)
+                self.assertEqual(changed.end, original.end)
+                self.assertEqual(changed.cooldown_end, original.cooldown_end)
+        await self.receive(self.message("/断电"))
+        await self.receive(self.message("/电流 20"))
+        changed = await self.plugin.store.get("group-a")
+        self.assertTrue(changed.active)
+        self.assertEqual(changed.voltage, 20)
+        self.assertEqual(changed.end, original.end)
+        self.assertEqual(changed.cooldown_end, original.cooldown_end)
+        success, result = await self.command_manager.execute_command(self.message("/imm_status"))
+        self.assertTrue(success, result)
+        self.assertIn("电压", result)
+        self.assertIn("20", result)
+        self.assertIn("100", result)
+
+    async def test_electric_overload_acknowledges_immediately_and_retries_only_one_storyline(self) -> None:
+        self.plugin.config.prompts.enter_template = "TEST_CONTROL"
+        self.plugin.config.prompts.electric_template = "TEST_ELECTRIC V:{voltage}"
+        self.plugin.config.prompts.exit_template = "TEST_NORMAL_EXIT"
+        self.plugin.config.prompts.overload_template = "TEST_OVERLOAD V:{voltage} LIMIT:{overload_voltage}"
+        await self.receive(self.message("/电流 80"))
+        original = await self.plugin.store.get("group-a")
+        before = self.transport.await_count
+        decision = await self.receive(self.message("/电压 120"))
+        self.assertEqual(decision, self.fw.event.EventDecision.STOP)
+        self.assertEqual(self.transport.await_count, before + 1)
+        overloaded = await self.plugin.store.get("group-a")
+        self.assertFalse(overloaded.active)
+        self.assertEqual(overloaded.reason, "overload")
+        self.assertEqual(overloaded.voltage, 120)
+        self.assertEqual(overloaded.cooldown_end, original.cooldown_end)
+        client = CapturingClient(failures=1)
+        request = self.new_llm_request(client, max_retry=1)
+        await request.send(auto_append_response=False, stream=False)
+        self.assertEqual(len(client.calls), 2)
+        first = self.transient_text(client.calls[0]["payloads"])
+        self.assertTrue(first)
+        self.assertEqual(self.transient_text(client.calls[1]["payloads"]), first)
+        storyline = "\n".join(first)
+        self.assertIn("TEST_OVERLOAD V:120 LIMIT:100", storyline)
+        self.assertNotIn("TEST_NORMAL_EXIT", storyline)
+        self.assertNotIn("TEST_CONTROL", storyline)
+        self.assertNotIn("TEST_ELECTRIC", storyline)
+        self.assertNotIn("_mofox_immersive_exit_retry", request.meta_data)
+        await request.send(auto_append_response=False, stream=False)
+        self.assertEqual(self.transient_text(client.calls[-1]["payloads"]), [])
+        await self.receive(self.message("/电流 20"))
+        cooling = await self.plugin.store.get("group-a")
+        self.assertFalse(cooling.active)
+        self.assertEqual(cooling.cooldown_end, original.cooldown_end)
+
+    async def test_electric_concurrent_increases_reach_one_overload_without_losing_updates(self) -> None:
+        self.plugin.config.prompts.overload_template = "TEST_OVERLOAD V:{voltage} LIMIT:{overload_voltage}"
+        await self.receive(self.message("/电流 80"))
+        original = await self.plugin.store.get("group-a")
+        tasks = []
+        try:
+            async with self.plugin.store._lock:
+                tasks = [
+                    asyncio.create_task(self.receive(self.message("/加压", sender="member-1"))),
+                    asyncio.create_task(self.receive(self.message("/加压", sender="member-2"))),
+                ]
+                for _ in range(40):
+                    waiters = getattr(self.plugin.store._lock, "_waiters", None) or ()
+                    if len(waiters) >= 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertGreaterEqual(len(waiters), 2, "Both voltage handlers must wait before release")
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        overloaded = await self.plugin.store.get("group-a")
+        self.assertFalse(overloaded.active)
+        self.assertEqual(overloaded.voltage, 100)
+        self.assertEqual(overloaded.reason, "overload")
+        self.assertEqual(overloaded.cooldown_end, original.cooldown_end)
+        first = "\n".join(self.transient_text(await self.request("group-a")))
+        self.assertIn("TEST_OVERLOAD V:100 LIMIT:100", first)
+        self.assertEqual(self.transient_text(await self.request("group-a")), [])
+
+    async def test_electric_voltage_is_shared_in_one_stream_and_isolated_from_other_streams(self) -> None:
+        self.plugin.config.prompts.electric_template = "TEST_ELECTRIC V:{voltage} LIMIT:{overload_voltage}"
+        await self.receive(self.message("/电流 20", sender="member-1"))
+        await self.receive(self.message("/控制 5", stream="group-b", sender="member-2"))
+        await self.receive(self.message("/电压 40", sender="member-3"))
+        shared = await self.plugin.store.get("group-a")
+        unrelated = await self.plugin.store.get("group-b")
+        self.assertEqual(shared.voltage, 40)
+        self.assertIsNone(unrelated.voltage)
+        self.assertEqual(unrelated.level, 5)
+        self.assertIn("TEST_ELECTRIC V:40", "\n".join(self.transient_text(await self.request("group-a"))))
+        self.assertNotIn("TEST_ELECTRIC", "\n".join(self.transient_text(await self.request("group-b"))))
+        self.assertEqual(self.transient_text(await self.request("group-c")), [])
+        await self.receive(self.message("/断电", sender="member-4"))
+        self.assertTrue((await self.plugin.store.get("group-a")).active)
+        self.assertIsNone((await self.plugin.store.get("group-a")).voltage)
+        self.assertEqual(await self.plugin.store.get("group-b"), unrelated)
+
+    async def test_electric_invalid_inputs_and_inactive_adjustments_do_not_create_sessions(self) -> None:
+        for command in (
+            "/电流 -1",
+            "/电流 1000001",
+            "/电流 abc",
+            "/电压 -1",
+            "/电压 abc",
+            "/电压 20",
+            "/电压",
+            "/加压",
+            "/减压",
+            "/断电",
+            "/加压 0",
+            "/减压 -1",
+        ):
+            with self.subTest(command=command):
+                before = self.transport.await_count
+                await self.receive(self.message(command))
+                self.assertEqual(self.transport.await_count, before + 1)
+                self.assertIsNone(await self.plugin.store.get("group-a"))
+                self.assertEqual(self.transient_text(await self.request("group-a")), [])
+        await self.receive(self.message("/td 2"))
+        original = await self.plugin.store.get("group-a")
+        for command in ("/加压", "/减压", "/电压 -1", "/电流 abc"):
+            await self.receive(self.message(command))
+            self.assertEqual(await self.plugin.store.get("group-a"), original)
+
+    async def test_electric_cold_start_obeys_capacity_and_existing_cooldown(self) -> None:
+        self.plugin.settings.max_concurrent = 1
+        await self.receive(self.message("/电流 20"))
+        await self.receive(self.message("/电流 10", stream="group-b"))
+        self.assertIsNone(await self.plugin.store.get("group-b"))
+        await self.receive(self.message("/断电"))
+        self.assertTrue((await self.plugin.store.get("group-a")).active)
+        await self.receive(self.message("/电流 10", stream="group-b"))
+        self.assertIsNone(await self.plugin.store.get("group-b"))
+        await self.receive(self.message("/td stop"))
+        original = await self.plugin.store.get("group-a")
+        await self.receive(self.message("/电流 10"))
+        cooling = await self.plugin.store.get("group-a")
+        self.assertFalse(cooling.active)
+        self.assertEqual(cooling.cooldown_end, original.cooldown_end)
+        await self.receive(self.message("/电流 10", stream="group-b"))
+        self.assertTrue((await self.plugin.store.get("group-b")).active)
+        await self.receive(self.message("/td stop", stream="group-b"))
+        self.clock.now = original.cooldown_end + 1
+        await self.receive(self.message("/电流 30"))
+        restarted = await self.plugin.store.get("group-a")
+        self.assertTrue(restarted.active)
+        self.assertEqual(restarted.voltage, 30)
+
+    async def test_electric_commands_obey_enabled_and_real_admin_only_permissions(self) -> None:
+        await self.receive(self.message("/电流 20"))
+        original = await self.plugin.store.get("group-a")
+        inherited = await self.request("group-a")
+        self.plugin.settings.enabled = False
+        for command in ("/电流 30", "/电压", "/电压 30", "/加压", "/断电"):
+            before = self.transport.await_count
+            await self.receive(self.message(command))
+            self.assertEqual(self.transport.await_count, before)
+            self.assertEqual(await self.plugin.store.get("group-a"), original)
+        self.assertEqual(self.transient_text(await self.request("group-a", inherited)), [])
+        self.plugin.settings.enabled = True
+        self.plugin.settings.admin_only_mode = True
+        for command in ("/电流 30", "/电压", "/电压 30", "/加压", "/断电"):
+            decision = await self.receive(self.message(command, sender="ordinary-user"))
+            self.assertEqual(decision, self.fw.event.EventDecision.STOP)
+            self.assertIn("操作员", self.transport.await_args.args[0].content)
+            self.assertEqual(await self.plugin.store.get("group-a"), original)
+        await self.receive(self.message("/电压 30", sender="operator"))
+        self.assertEqual((await self.plugin.store.get("group-a")).voltage, 30)
+        await self.receive(self.message("/断电", sender="owner"))
+        self.assertTrue((await self.plugin.store.get("group-a")).active)
+        self.assertIsNone((await self.plugin.store.get("group-a")).voltage)
+
+    async def test_electric_group_controls_require_the_correct_bot_mention(self) -> None:
+        await self.receive(self.message("/电流 20"))
+        with patch.object(
+            self.fw.adapter_api,
+            "get_bot_info_by_platform",
+            AsyncMock(return_value={"bot_id": "bot-123"}),
+        ):
+            for text in ("电流 30", "电压", "电压 30", "加压", "断电"):
+                for at_users in ([], [{"user_id": "other-id"}]):
+                    before = self.transport.await_count
+                    await self.receive(self.message(text, at_users=at_users))
+                    self.assertEqual(self.transport.await_count, before)
+                    self.assertEqual((await self.plugin.store.get("group-a")).voltage, 20)
+            changed = self.message("@<Robot:bot-123> 电压 30", at_users=[{"user_id": "bot-123"}])
+            await self.receive(changed)
+            self.assertEqual((await self.plugin.store.get("group-a")).voltage, 30)
+            self.assertEqual(changed.extra["at_users"], [{"user_id": "bot-123"}])
+            await self.receive(self.message("@<Robot:bot-123> 电压", at_users=[{"user_id": "bot-123"}]))
+            self.assertIn("30", self.transport.await_args.args[0].content)
+        await self.receive(self.message("/加压 5"))
+        self.assertEqual((await self.plugin.store.get("group-a")).voltage, 35)
+
+    async def test_electric_native_config_rejects_invalid_bounds_and_preserves_invalid_reload(self) -> None:
+        config_class = type(self.plugin.config)
+        for values in (
+            {"default_voltage": -1},
+            {"default_voltage": 1000001},
+            {"default_voltage": True},
+            {"default_voltage": "10"},
+            {"voltage_step": 0},
+            {"voltage_step": 1000001},
+            {"voltage_step": 10.0},
+            {"overload_voltage": 0},
+            {"overload_voltage": 10001},
+            {"overload_voltage": False},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                config_class.model_validate({"plugin": values})
+        accepted = config_class.model_validate(
+            {"plugin": {"default_voltage": 0, "voltage_step": 1, "overload_voltage": 1}}
+        )
+        self.assertEqual(accepted.plugin.default_voltage, 0)
+        config_path = self.workdir / "config" / "plugins" / self.plugin_name / "config.toml"
+        original_file = config_path.read_text(encoding="utf-8")
+        original_config = self.plugin.config
+        invalid_file = re.sub(r"(?m)^default_voltage\s*=.*$", "default_voltage = -1", original_file, count=1)
+        self.assertNotEqual(invalid_file, original_file)
+        config_path.write_text(invalid_file, encoding="utf-8")
+        success, result = await self.command_manager.execute_command(self.message("/imm_reload"))
+        self.assertFalse(success, result)
+        self.assertIs(self.plugin.config, original_config)
+        self.assertEqual(config_path.read_text(encoding="utf-8"), invalid_file)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,8 +24,8 @@ class ImmersiveControlPlugin(BasePlugin):
     """使用原生事件与命令扩展聊天，不替换框架的 Chatter。"""
 
     plugin_name = "mofox_plugin_immersive_control"
-    plugin_description = "限时沉浸式互动、五档调节、会话冷却、权限及持久化"
-    plugin_version = "1.1.0"
+    plugin_description = "限时沉浸式互动、五档调节、虚拟电流与过载剧情、会话冷却、权限及持久化"
+    plugin_version = "1.2.0"
     configs: list[type] = [ImmersiveControlConfig]
     dependent_components: list[str] = ["default_chatter:chatter:default_chatter"]
 

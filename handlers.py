@@ -11,15 +11,18 @@ from src.kernel.event import EventDecision
 
 from .config import DEFAULT_ENTER_TEMPLATE, DEFAULT_EXIT_TEMPLATE
 from .logic import (
+    describe_electric,
     describe_level,
     effective_sensitivity,
     entry_level,
     level_name,
     match_control,
     normalize_message,
+    parse_electric_command,
     parse_gear_command,
     render_prompt,
 )
+from .prompts import DEFAULT_ELECTRIC_TEMPLATE, DEFAULT_OVERLOAD_TEMPLATE
 
 PROMPT_MARKER = "[mofox_immersive_control:transient]\n"
 _EXIT_RETRY_METADATA_KEY = "_mofox_immersive_exit_retry"
@@ -51,13 +54,18 @@ class ImmersiveMessageHandler(BaseEventHandler):
             return EventDecision.PASS, params
         operation = match_control(normalized, settings.enter_keywords, settings.exit_keywords)
         gear_request = None
+        electric_request = None
         input_error = None
         if operation != "exit":
             try:
-                gear_request = parse_gear_command(normalized)
+                electric_request = parse_electric_command(normalized)
+                if electric_request is None:
+                    gear_request = parse_gear_command(normalized)
             except ValueError as error:
                 input_error = str(error)
-            if gear_request is not None or input_error:
+            if electric_request is not None:
+                operation = "electric"
+            elif gear_request is not None or input_error:
                 operation = "gear"
         if operation is None:
             return EventDecision.PASS, params
@@ -83,6 +91,48 @@ class ImmersiveMessageHandler(BaseEventHandler):
 
         if input_error:
             await self.plugin.reply(input_error, message, params.get("adapter_signature"))
+            return EventDecision.STOP, params
+        if electric_request is not None:
+            kind, voltage = electric_request
+            if kind == "query":
+                record = await self.plugin.store.get(message.stream_id)
+                reply = (
+                    describe_electric(record.voltage, settings.overload_voltage, active=record.active)
+                    if record is not None
+                    else "虚拟电流模式: 未开启。使用 /电流 或 /电流 10 启动"
+                )
+            else:
+                if kind == "enable":
+                    success, result, record = await self.plugin.store.enable_electric(
+                        message.stream_id,
+                        settings.default_voltage if voltage is None else voltage,
+                        settings.overload_voltage,
+                        level=settings.default_level,
+                    )
+                elif kind == "set":
+                    success, result, record = await self.plugin.store.set_voltage(
+                        message.stream_id, voltage, settings.overload_voltage
+                    )
+                elif kind in ("increase", "decrease"):
+                    step = settings.voltage_step if voltage is None else voltage
+                    success, result, record = await self.plugin.store.shift_voltage(
+                        message.stream_id,
+                        step if kind == "increase" else -step,
+                        settings.overload_voltage,
+                    )
+                else:
+                    success, result, record = await self.plugin.store.off_electric(message.stream_id)
+                if not success or record is None:
+                    reply = result
+                elif record.reason == "overload" and not record.active:
+                    reply = "虚拟控制器过载爆炸！本次控制已结束。\n" + describe_electric(
+                        record.voltage, settings.overload_voltage, active=False
+                    )
+                elif kind == "off":
+                    reply = "电流模式已关闭，当前控制状态及档位保留"
+                else:
+                    reply = describe_electric(record.voltage, settings.overload_voltage)
+            await self.plugin.reply(reply, message, params.get("adapter_signature"))
             return EventDecision.STOP, params
         if gear_request is not None:
             kind, level = gear_request
@@ -202,9 +252,14 @@ class ImmersivePromptHandler(BaseEventHandler):
             if record.active:
                 template = self.plugin.config.prompts.enter_template.strip() or DEFAULT_ENTER_TEMPLATE
             elif record.exit_ts is not None:
-                if await self.plugin.store.complete_exit(stream_id) is None:
+                record = await self.plugin.store.complete_exit(stream_id)
+                if record is None:
                     return EventDecision.SUCCESS, params
-                template = self.plugin.config.prompts.exit_template.strip() or DEFAULT_EXIT_TEMPLATE
+                template = (
+                    self.plugin.config.prompts.overload_template.strip() or DEFAULT_OVERLOAD_TEMPLATE
+                    if record.reason == "overload"
+                    else self.plugin.config.prompts.exit_template.strip() or DEFAULT_EXIT_TEMPLATE
+                )
             else:
                 return EventDecision.SUCCESS, params
             settings = self.plugin.settings
@@ -212,10 +267,27 @@ class ImmersivePromptHandler(BaseEventHandler):
                 settings.sensitivity, record.level, settings.level_multipliers
             )
             prompt = render_prompt(
-                template, item_name=settings.item_name, sensitivity=sensitivity, level=record.level
+                template,
+                item_name=settings.item_name,
+                sensitivity=sensitivity,
+                level=record.level,
+                voltage=record.voltage,
+                overload_voltage=settings.overload_voltage,
             )
             if record.active:
                 prompt += f"\n\n[当前档位：{record.level}/5（{level_name(record.level)}），本档反应强度：{sensitivity}%]"
+                if record.voltage is not None:
+                    electric_template = (
+                        self.plugin.config.prompts.electric_template.strip() or DEFAULT_ELECTRIC_TEMPLATE
+                    )
+                    prompt += "\n\n" + render_prompt(
+                        electric_template,
+                        item_name=settings.item_name,
+                        sensitivity=sensitivity,
+                        level=record.level,
+                        voltage=record.voltage,
+                        overload_voltage=settings.overload_voltage,
+                    )
             if not record.active:
                 # EventBus 浅拷贝顶层字典，meta_data 仍是同一逻辑请求的对象。
                 # 保留已消费的退出提示供 provider 重试；成功或重试耗尽即移除。

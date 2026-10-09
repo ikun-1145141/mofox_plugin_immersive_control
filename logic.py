@@ -64,6 +64,41 @@ def parse_gear_command(text: str) -> tuple[str, int | None] | None:
     return None
 
 
+def parse_voltage(value: str, *, positive: bool = False) -> int:
+    """解析剧情用的整数电压或步长，支持 V/v/伏/伏特 后缀。"""
+    value = re.sub(r"(?:[Vv]|伏特|伏)$", "", value.strip()).strip()
+    if re.fullmatch(r"\d+", value):
+        voltage = int(value)
+        if (1 if positive else 0) <= voltage <= 1000000:
+            return voltage
+    minimum = 1 if positive else 0
+    raise ValueError(f"{'增减量' if positive else '虚拟电压'}必须是 {minimum}–1000000 的整数")
+
+
+def parse_electric_command(text: str) -> tuple[str, int | None] | None:
+    """识别虚拟电流指令，未知文本放行，已识别的错误参数给出反馈。"""
+    for keyword in ("td electric", "电流"):
+        if text == keyword:
+            return "enable", None
+        if text.startswith(keyword + " "):
+            return "enable", parse_voltage(text[len(keyword) + 1 :])
+    for keyword in ("td voltage", "电压"):
+        if text == keyword:
+            return "query", None
+        if text.startswith(keyword + " "):
+            return "set", parse_voltage(text[len(keyword) + 1 :])
+    for keyword, kind in (("加压", "increase"), ("减压", "decrease")):
+        if text == keyword:
+            return kind, None
+        if text.startswith(keyword + " "):
+            return kind, parse_voltage(text[len(keyword) + 1 :], positive=True)
+    if text == "断电":
+        return "off", None
+    if text.startswith("断电 "):
+        raise ValueError("用法：/断电，无需附加参数")
+    return None
+
+
 def entry_level(text: str, keywords: Sequence[str], default_level: int) -> int:
     """按最长进入关键词解析选档参数，保留普通场景描述的旧用法。"""
     normalized_keywords = sorted(
@@ -106,11 +141,32 @@ def describe_level(level: int, base: int, multipliers: Sequence[float]) -> str:
     )
 
 
-def render_prompt(template: str, *, item_name: str, sensitivity: int, level: int = 3) -> str:
+def describe_electric(voltage: int | None, threshold: int, *, active: bool = True) -> str:
+    """显示游戏电压和模式状态，0V 与未开启是不同状态。"""
+    if voltage is None:
+        return "虚拟电流模式: 未开启"
+    return f"虚拟电流模式: {'已开启' if active else '已结束'}\n虚拟电压: {voltage}V / 过载阈值: {threshold}V"
+
+
+def render_prompt(
+    template: str,
+    *,
+    item_name: str,
+    sensitivity: int,
+    level: int = 3,
+    voltage: int | None = None,
+    overload_voltage: int = 100,
+) -> str:
     """仅替换支持的变量，保留自定义模板中的 JSON 和其他花括号。"""
     return (
         template.replace("{item_name}", item_name)
         .replace("{sensitivity}", str(sensitivity))
         .replace("{level}", str(level))
         .replace("{level_name}", level_name(level))
+        .replace("{voltage}", str(voltage) if voltage is not None else "未开启")
+        .replace("{overload_voltage}", str(overload_voltage))
+        .replace(
+            "{voltage_ratio}",
+            str(min(100, round(voltage / overload_voltage * 100))) if voltage is not None else "0",
+        )
     )

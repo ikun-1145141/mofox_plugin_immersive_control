@@ -1,8 +1,8 @@
 {
   "name": "mofox_plugin_immersive_control",
   "display_name": "沉浸式控制",
-  "version": "1.1.0",
-  "description": "AstrBot 沉浸式控制插件的 Neo-MoFox 移植版：五档调节、限时互动、冷却、权限与持久化",
+  "version": "1.2.0",
+  "description": "AstrBot 沉浸式控制插件的 Neo-MoFox 移植版：五档调节、虚拟电流与过载剧情、限时互动、冷却、权限与持久化",
   "author": "ikun-1145141（移植）；木有知、Zhalslar（原作）",
   "license": "AGPL-3.0",
   "repository": "https://github.com/ikun-1145141/mofox_plugin_immersive_control",

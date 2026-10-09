@@ -5,7 +5,12 @@ from typing import Annotated, ClassVar
 from pydantic import FiniteFloat
 from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_section
 
-from .prompts import DEFAULT_ENTER_TEMPLATE, DEFAULT_EXIT_TEMPLATE
+from .prompts import (
+    DEFAULT_ELECTRIC_TEMPLATE,
+    DEFAULT_ENTER_TEMPLATE,
+    DEFAULT_EXIT_TEMPLATE,
+    DEFAULT_OVERLOAD_TEMPLATE,
+)
 
 
 class ImmersiveControlConfig(BaseConfig):
@@ -54,6 +59,15 @@ class ImmersiveControlConfig(BaseConfig):
             min_items=5,
             max_items=5,
         )
+        default_voltage: int = Field(
+            default=10, ge=0, le=1000000, strict=True, description="电流模式默认虚拟电压（剧情数值）"
+        )
+        voltage_step: int = Field(
+            default=10, ge=1, le=1000000, strict=True, description="未指定增减量时的虚拟电压步长"
+        )
+        overload_voltage: int = Field(
+            default=100, ge=1, le=10000, strict=True, description="达到此虚拟电压时触发过载爆炸剧情并结束控制"
+        )
         persist_state: bool = Field(default=True, description="将会话状态和冷却持久化，支持重启恢复")
 
     @config_section("prompts")
@@ -67,6 +81,13 @@ class ImmersiveControlConfig(BaseConfig):
         exit_template: str = Field(
             default=DEFAULT_EXIT_TEMPLATE,
             description="退出模板，支持 {item_name}、{sensitivity}、{level}、{level_name}",
+        )
+        electric_template: str = Field(
+            default=DEFAULT_ELECTRIC_TEMPLATE,
+            description="电流附加模板，另支持 {voltage}、{overload_voltage}、{voltage_ratio}",
+        )
+        overload_template: str = Field(
+            default=DEFAULT_OVERLOAD_TEMPLATE, description="过载后一次性恢复模板，支持电压及档位变量"
         )
 
     plugin: PluginSection = Field(default_factory=PluginSection)

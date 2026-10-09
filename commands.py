@@ -9,7 +9,7 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BaseCommand, cmd_route
 from src.app.plugin_system.types import PermissionLevel
 
-from .logic import describe_level
+from .logic import describe_electric, describe_level
 
 logger = get_logger("immersive_commands")
 
@@ -43,10 +43,13 @@ class ImmStatusCommand(_AdminCommand):
         if record:
             settings = self.plugin.settings
             lines.append(describe_level(record.level, settings.sensitivity, settings.level_multipliers))
+            lines.append(describe_electric(record.voltage, settings.overload_voltage, active=record.active))
             if record.active and record.end is not None:
                 lines.append(f"剩余时间: {max(0, math.ceil(record.end - now))}秒")
             elif record.exit_ts is not None:
-                reason = "主动结束" if record.reason == "user" else "时间到期"
+                reason = {"user": "主动结束", "expire": "时间到期", "overload": "虚拟控制器过载爆炸"}.get(
+                    record.reason, "未知"
+                )
                 lines.append(f"退出原因: {reason}（等待下一次回复恢复）")
             cooldown = max(0, math.ceil(record.cooldown_end - now))
             if cooldown:

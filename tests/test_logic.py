@@ -84,6 +84,36 @@ class KeywordMatchingTests(unittest.TestCase):
 
 
 class PromptRenderingTests(unittest.TestCase):
+    def test_all_seven_supported_variables_preserve_json_and_unknown_placeholders(self):
+        template = (
+            '{"item": "{item_name}", "sensitivity": {sensitivity}, "level": {level}, '
+            '"level_name": "{level_name}", "voltage": {voltage}, '
+            '"threshold": {overload_voltage}, "ratio": {voltage_ratio}, "nested": {"x": 1}}\n{unknown}'
+        )
+        self.assertEqual(
+            LOGIC.render_prompt(
+                template, item_name="虚拟装置", sensitivity=75, level=4, voltage=50, overload_voltage=100
+            ),
+            '{"item": "虚拟装置", "sensitivity": 75, "level": 4, "level_name": "高档", '
+            '"voltage": 50, "threshold": 100, "ratio": 50, "nested": {"x": 1}}\n{unknown}',
+        )
+
+    def test_voltage_zero_differs_from_disabled_and_ratio_caps_at_one_hundred(self):
+        template = "{voltage} / {overload_voltage} ({voltage_ratio}%)"
+        for voltage, expected in (
+            (None, "未开启 / 100 (0%)"),
+            (0, "0 / 100 (0%)"),
+            (100, "100 / 100 (100%)"),
+            (150, "150 / 100 (100%)"),
+        ):
+            with self.subTest(voltage=voltage):
+                self.assertEqual(
+                    LOGIC.render_prompt(
+                        template, item_name="虚拟装置", sensitivity=50, voltage=voltage, overload_voltage=100
+                    ),
+                    expected,
+                )
+
     def test_gear_placeholders_preserve_json_and_unknown_braces(self):
         template = (
             '{"device": "{item_name}", "gear": {level}, "name": "{level_name}", '
@@ -202,6 +232,94 @@ class GearSensitivityTests(unittest.TestCase):
         for level in (True, 0, 6, 1.0):
             with self.subTest(level=level), self.assertRaises(ValueError):
                 LOGIC.effective_sensitivity(50, level, self.MULTIPLIERS)
+
+
+class ElectricParsingTests(unittest.TestCase):
+    def test_virtual_voltage_accepts_units_zero_and_upper_bound(self):
+        for value, expected in (("0V", 0), ("10v", 10), ("10伏", 10), ("10伏特", 10), (" 10 V ", 10)):
+            with self.subTest(value=value):
+                self.assertEqual(LOGIC.parse_voltage(value), expected)
+        self.assertEqual(LOGIC.parse_voltage("1000000"), 1_000_000)
+        self.assertEqual(LOGIC.parse_voltage("1000000V", positive=True), 1_000_000)
+
+    def test_voltage_and_positive_steps_reject_invalid_or_extra_text(self):
+        for value in ("-1", "2.5", "True", "false", "10V extra", "10 伏 now", "1000001", ""):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "0–1000000"):
+                    LOGIC.parse_voltage(value)
+                with self.assertRaisesRegex(ValueError, "1–1000000"):
+                    LOGIC.parse_voltage(value, positive=True)
+        for value in ("0", "0V", "0伏特"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "1–1000000"):
+                LOGIC.parse_voltage(value, positive=True)
+        self.assertEqual(LOGIC.parse_voltage("10伏特", positive=True), 10)
+
+    def test_enable_query_and_set_aliases(self):
+        for keyword in ("td electric", "电流"):
+            with self.subTest(keyword=keyword):
+                self.assertEqual(LOGIC.parse_electric_command(keyword), ("enable", None))
+                self.assertEqual(LOGIC.parse_electric_command(f"{keyword} 0V"), ("enable", 0))
+                self.assertEqual(LOGIC.parse_electric_command(f"{keyword} 20伏特"), ("enable", 20))
+        for keyword in ("td voltage", "电压"):
+            with self.subTest(keyword=keyword):
+                self.assertEqual(LOGIC.parse_electric_command(keyword), ("query", None))
+                self.assertEqual(LOGIC.parse_electric_command(f"{keyword} 0"), ("set", 0))
+                self.assertEqual(LOGIC.parse_electric_command(f"{keyword} 40v"), ("set", 40))
+
+    def test_relative_commands_use_optional_strictly_positive_step(self):
+        for keyword, kind in (("加压", "increase"), ("减压", "decrease")):
+            with self.subTest(keyword=keyword):
+                self.assertEqual(LOGIC.parse_electric_command(keyword), (kind, None))
+                self.assertEqual(LOGIC.parse_electric_command(f"{keyword} 10V"), (kind, 10))
+                for argument in ("0", "-10", "2.5", "true", "10 extra", "1000001"):
+                    with self.subTest(argument=argument), self.assertRaises(ValueError):
+                        LOGIC.parse_electric_command(f"{keyword} {argument}")
+
+    def test_off_command_rejects_extra_arguments(self):
+        self.assertEqual(LOGIC.parse_electric_command("断电"), ("off", None))
+        with self.assertRaisesRegex(ValueError, "无需附加参数"):
+            LOGIC.parse_electric_command("断电 now")
+
+    def test_unknown_ordinary_text_and_near_names_pass_through(self):
+        for text in ("普通话", "今天电压很高", "电压foo", "电流foo", "断电器", "加压阀", "td voltagefoo"):
+            with self.subTest(text=text):
+                self.assertIsNone(LOGIC.parse_electric_command(text))
+        for message in ("/td stop", "@<机器人:100> /td stop now"):
+            text, _ = LOGIC.normalize_message(message)
+            with self.subTest(message=message):
+                self.assertEqual(LOGIC.match_control(text, ["td"], ["td stop"]), "exit")
+                self.assertIsNone(LOGIC.parse_electric_command(text))
+
+    def test_known_electric_commands_with_bad_parameters_raise_instead_of_passing(self):
+        for command in ("电流 nope", "td electric 2.5", "电压 20V extra", "td voltage -1"):
+            with self.subTest(command=command), self.assertRaisesRegex(ValueError, "虚拟电压"):
+                LOGIC.parse_electric_command(command)
+
+    def test_electric_command_uses_shared_message_normalization(self):
+        text, explicit = LOGIC.normalize_message("@<机器人:100> /td\telectric\u30000V")
+        self.assertTrue(explicit)
+        self.assertEqual(LOGIC.parse_electric_command(text), ("enable", 0))
+
+
+class ElectricDescriptionTests(unittest.TestCase):
+    def test_active_zero_and_inactive_voltages_have_distinct_phase_descriptions(self):
+        self.assertEqual(
+            LOGIC.describe_electric(20, 100),
+            "虚拟电流模式: 已开启\n虚拟电压: 20V / 过载阈值: 100V",
+        )
+        self.assertEqual(
+            LOGIC.describe_electric(0, 100),
+            "虚拟电流模式: 已开启\n虚拟电压: 0V / 过载阈值: 100V",
+        )
+        self.assertEqual(
+            LOGIC.describe_electric(120, 100, active=False),
+            "虚拟电流模式: 已结束\n虚拟电压: 120V / 过载阈值: 100V",
+        )
+
+    def test_disabled_mode_is_described_as_off_regardless_of_control_phase(self):
+        for active in (True, False):
+            with self.subTest(active=active):
+                self.assertEqual(LOGIC.describe_electric(None, 100, active=active), "虚拟电流模式: 未开启")
 
 
 if __name__ == "__main__":
